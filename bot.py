@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 import asyncio
 from aiohttp import web
 
-# Загружаем переменные (на Render они подтянутся из панели управления)
+# Загружаем переменные
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(BASE_DIR, "variables.env")
 load_dotenv(dotenv_path=env_path)
@@ -25,32 +25,56 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Простейший веб-обработчик, на который будет стучаться UptimeRobot
+cached_webhook = None
+
+# Функция поиска или создания вебхука в целевом канале
+async def get_target_webhook(channel):
+    global cached_webhook
+    if cached_webhook:
+        return cached_webhook
+    try:
+        webhooks = await channel.webhooks()
+        for wh in webhooks:
+            if wh.name == "Bridge Webhook":
+                cached_webhook = wh
+                return cached_webhook
+        cached_webhook = await channel.create_webhook(name="Bridge Webhook")
+        return cached_webhook
+    except discord.Forbidden:
+        print(f"⚠️ Нет прав на управление вебхуками в канале {channel.id}!")
+        return None
+    except Exception as e:
+        print(f"Ошибка вебхука: {e}")
+        return None
+
+# Простейший веб-обработчик для UptimeRobot
 async def handle(request):
     return web.Response(text="Бот Пересыльщик активен и работает на Render!")
 
 @bot.event
 async def on_ready():
     print(f"✅ Бот успешно авторизован как: {bot.user.name}")
-    print("🚀 МОСТ ПЕРЕСЫЛКИ НАМЕРТВО ЗАКРЕПЛЕН В ОБЛАКЕ RENDER!")
+    print("🚀 МОСТ С ВЕБХУКАМИ УСПЕШНО ЗАПУЩЕН НА RENDER!")
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Игнорируем сообщения от самого бота
+    # Защита от зацикливания: игнорируем себя и свои же вебхуки
     if message.author == bot.user or message.webhook_id:
+        global cached_webhook
+        if cached_webhook and message.webhook_id == cached_webhook.id:
+            return
         return
 
-    # Проверяем, что сообщение из нужного канала
+    # Проверяем канал отправки
     if message.channel.id == SOURCE_CHANNEL_ID:
         target_channel = bot.get_channel(TARGET_CHANNEL_ID)
         if target_channel is None:
             try: 
                 target_channel = await bot.fetch_channel(TARGET_CHANNEL_ID)
-            except Exception as e: 
-                print(f"Не удалось найти целевой канал: {e}")
+            except: 
                 return
 
-        # Собираем вложения (картинки, файлы)
+        # Скачиваем вложения, если они есть
         files = []
         if message.attachments:
             for attachment in message.attachments:
@@ -59,39 +83,61 @@ async def on_message(message: discord.Message):
                 except: 
                     pass
 
-        # Формируем красивое имя автора
+        # Копируем аватарку, ник и добавляем имя сервера для ясности
         guild_name = f" [{message.guild.name}]" if message.guild else ""
         display_name = f"{message.author.display_name}{guild_name}"
+        avatar_url = message.author.display_avatar.url
+
+        # Стучимся за вебхуком
+        webhook = await get_target_webhook(target_channel)
 
         try:
-            # Прямая отправка в канал (самый стабильный вариант для Render)
-            if message.embeds:
-                await target_channel.send(embed=message.embeds[0], files=files if files else None)
-            else:
-                clean_text = f"**{display_name}:** {message.content}"
-                if message.content or files:
-                    await target_channel.send(
-                        content=clean_text if message.content else f"**{display_name}** прикрепил файлы:", 
-                        files=files if files else None
+            if webhook:
+                # Если в сообщении есть эмбед (например, ссылка с превью)
+                if message.embeds:
+                    await webhook.send(
+                        username=display_name, 
+                        avatar_url=avatar_url, 
+                        embed=message.embeds[0], 
+                        files=files if files else discord.utils.MISSING
                     )
+                else:
+                    content = message.content if message.content else None
+                    if content or files:
+                        await webhook.send(
+                            content=content, 
+                            username=display_name, 
+                            avatar_url=avatar_url, 
+                            files=files if files else discord.utils.MISSING
+                        )
+            else:
+                # Резервный вариант без вебхука, если на сервере нет прав
+                if message.embeds:
+                    await target_channel.send(embed=message.embeds[0], files=files if files else None)
+                else:
+                    clean_text = f"**{display_name}:** {message.content}"
+                    if message.content or files:
+                        await target_channel.send(
+                            content=clean_text if message.content else f"**{display_name}** прикрепил файлы:", 
+                            files=files if files else None
+                        )
         except Exception as e:
-            print(f"Ошибка отправки сообщения: {e}")
+            print(f"Ошибка отправки через вебхук: {e}")
 
     await bot.process_commands(message)
 
 async def main():
-    # 1. Мгновенно поднимаем веб-сервер на порту 10000 для прохождения проверки Render
+    # Поднимаем веб-сервер для прохождения проверок Render и пинга UptimeRobot
     app = web.Application()
     app.router.add_get('/', handle)
     runner = web.AppRunner(app)
     await runner.setup()
     
-    # Порт 10000 — строго для Render
     site = web.TCPSite(runner, '0.0.0.0', 10000)
     await site.start()
     print("🌐 Наземный веб-сервер aiohttp успешно открыл порт 10000!")
 
-    # 2. Запускаем Дискорд бота в этой же петле событий
+    # Стартуем бота
     try:
         await bot.start(TOKEN)
     except KeyboardInterrupt:
