@@ -54,7 +54,7 @@ async def handle(request):
 @bot.event
 async def on_ready():
     print(f"✅ Бот успешно авторизован как: {bot.user.name}")
-    print("🚀 МОСТ С ВЕБХУКАМИ УСПЕШНО ЗАПУЩЕН НА RENDER!")
+    print("🚀 МОСТ С ИСПРАВЛЕННЫМИ ВЕБХУКАМИ И ЭМБЕДАМИ НА RENDER!")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -83,7 +83,7 @@ async def on_message(message: discord.Message):
                 except: 
                     pass
 
-        # Копируем аватарку, ник и добавляем имя сервера для ясности
+        # Копируем аватарку, ник и добавляем имя сервера
         guild_name = f" [{message.guild.name}]" if message.guild else ""
         display_name = f"{message.author.display_name}{guild_name}"
         avatar_url = message.author.display_avatar.url
@@ -93,27 +93,32 @@ async def on_message(message: discord.Message):
 
         try:
             if webhook:
-                # Если в сообщении есть эмбед (например, ссылка с превью)
+                # Фикс для Эмбедов: пересобираем их из оригинального сообщения
+                webhook_embeds = []
                 if message.embeds:
+                    for Glen_emb in message.embeds:
+                        webhook_embeds.append(discord.Embed.from_dict(Glen_emb.to_dict()))
+
+                content = message.content if message.content else None
+                
+                # Отправляем (теперь вебхук сожрёт и текст, и файлы, и эмбеды)
+                if content or files or webhook_embeds:
                     await webhook.send(
-                        username=display_name, 
-                        avatar_url=avatar_url, 
-                        embed=message.embeds[0], 
+                        content=content,
+                        username=display_name,
+                        avatar_url=avatar_url,
+                        embeds=webhook_embeds if webhook_embeds else discord.utils.MISSING,
                         files=files if files else discord.utils.MISSING
                     )
-                else:
-                    content = message.content if message.content else None
-                    if content or files:
-                        await webhook.send(
-                            content=content, 
-                            username=display_name, 
-                            avatar_url=avatar_url, 
-                            files=files if files else discord.utils.MISSING
-                        )
             else:
                 # Резервный вариант без вебхука, если на сервере нет прав
+                backup_embeds = []
                 if message.embeds:
-                    await target_channel.send(embed=message.embeds[0], files=files if files else None)
+                    for Glen_emb in message.embeds:
+                        backup_embeds.append(discord.Embed.from_dict(Glen_emb.to_dict()))
+
+                if backup_embeds:
+                    await target_channel.send(embed=backup_embeds[0], files=files if files else None)
                 else:
                     clean_text = f"**{display_name}:** {message.content}"
                     if message.content or files:
@@ -122,7 +127,7 @@ async def on_message(message: discord.Message):
                             files=files if files else None
                         )
         except Exception as e:
-            print(f"Ошибка отправки через вебхук: {e}")
+            print(f"🔴 Ошибка отправки: {e}")
 
     await bot.process_commands(message)
 
