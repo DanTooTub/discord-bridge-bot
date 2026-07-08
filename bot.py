@@ -54,18 +54,21 @@ async def handle(request):
 @bot.event
 async def on_ready():
     print(f"✅ Бот успешно авторизован как: {bot.user.name}")
-    print("🚀 МОСТ С ИСПРАВЛЕННЫМИ ВЕБХУКАМИ И ЭМБЕДАМИ НА RENDER!")
+    print("🚀 МОСТ С УМНОЙ ФИЛЬТРАЦИЕЙ БОТОВ ЗАПУЩЕН!")
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Защита от зацикливания: игнорируем себя и свои же вебхуки
-    if message.author == bot.user or message.webhook_id:
-        global cached_webhook
-        if cached_webhook and message.webhook_id == cached_webhook.id:
-            return
+    # УМНАЯ ЗАЩИТА ОТ ЗАЦИКЛИВАНИЯ:
+    # 1. Игнорируем сообщения от нашего собственного аккаунта бота
+    if message.author == bot.user:
         return
 
-    # Проверяем канал отправки
+    # 2. Игнорируем только НАШ вебхук (чтобы не было бесконечного спама)
+    global cached_webhook
+    if cached_webhook and message.webhook_id == cached_webhook.id:
+        return
+
+    # Проверяем канал отправки (теперь сообщения других ботов и чужие вебхуки пройдут!)
     if message.channel.id == SOURCE_CHANNEL_ID:
         target_channel = bot.get_channel(TARGET_CHANNEL_ID)
         if target_channel is None:
@@ -86,22 +89,25 @@ async def on_message(message: discord.Message):
         # Копируем аватарку, ник и добавляем имя сервера
         guild_name = f" [{message.guild.name}]" if message.guild else ""
         display_name = f"{message.author.display_name}{guild_name}"
-        avatar_url = message.author.display_avatar.url
+        avatar_url = message.author.display_avatar.url if message.author.display_avatar else None
 
         # Стучимся за вебхуком
         webhook = await get_target_webhook(target_channel)
 
         try:
             if webhook:
-                # Фикс для Эмбедов: пересобираем их из оригинального сообщения
+                # Фикс для Эмбедов: глубокое копирование структур
                 webhook_embeds = []
                 if message.embeds:
-                    for Glen_emb in message.embeds:
-                        webhook_embeds.append(discord.Embed.from_dict(Glen_emb.to_dict()))
+                    for emb in message.embeds:
+                        webhook_embeds.append(discord.Embed.from_dict(emb.to_dict()))
 
                 content = message.content if message.content else None
                 
-                # Отправляем (теперь вебхук сожрёт и текст, и файлы, и эмбеды)
+                # Если это чужой бот без аватарки, ставим заглушку, чтобы Discord API не ругался
+                if not avatar_url:
+                    avatar_url = webhook.url
+
                 if content or files or webhook_embeds:
                     await webhook.send(
                         content=content,
@@ -111,11 +117,11 @@ async def on_message(message: discord.Message):
                         files=files if files else discord.utils.MISSING
                     )
             else:
-                # Резервный вариант без вебхука, если на сервере нет прав
+                # Резервный вариант без вебхука
                 backup_embeds = []
                 if message.embeds:
-                    for Glen_emb in message.embeds:
-                        backup_embeds.append(discord.Embed.from_dict(Glen_emb.to_dict()))
+                    for emb in message.embeds:
+                        backup_embeds.append(discord.Embed.from_dict(emb.to_dict()))
 
                 if backup_embeds:
                     await target_channel.send(embed=backup_embeds[0], files=files if files else None)
@@ -132,7 +138,6 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 async def main():
-    # Поднимаем веб-сервер для прохождения проверок Render и пинга UptimeRobot
     app = web.Application()
     app.router.add_get('/', handle)
     runner = web.AppRunner(app)
@@ -142,7 +147,6 @@ async def main():
     await site.start()
     print("🌐 Наземный веб-сервер aiohttp успешно открыл порт 10000!")
 
-    # Стартуем бота
     try:
         await bot.start(TOKEN)
     except KeyboardInterrupt:
