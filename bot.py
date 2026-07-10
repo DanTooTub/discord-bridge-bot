@@ -58,47 +58,49 @@ async def on_ready():
         print(f"🔴 Ошибка синхронизации команд в Discord API: {e}")
 
 # СЛЭШ-КОМАНДА: Связать каналы
-@bot.tree.command(name="bconnect", description="Связать каналы")
+@bot.tree.command(name="bconnect", description="Связать исходный канал с целевым")
+@app_commands.describe(source="Канал, ОТКУДА забирать сообщения", target="Канал, КУДА пересылать сообщения")
 @app_commands.checks.has_permissions(administrator=True)
 async def bconnect(interaction: discord.Interaction, source: discord.TextChannel, target: discord.TextChannel):
     await interaction.response.defer(ephemeral=True)
     
-    key = f"bridge:{source.id}"
+    # Берем ID напрямую из свойств объекта, принудительно превращая в строку
+    source_id_str = str(source.id)
     target_id_str = str(target.id)
     
-    # Извлекаем данные и гарантированно переводим каждую запись в стандартную строку
-    current_targets_raw = await redis.lrange(key, 0, -1) or []
-    current_targets = []
-    for t in current_targets_raw:
-        if isinstance(t, bytes):
-            current_targets.append(t.decode('utf-8'))
-        else:
-            current_targets.append(str(t))
-            
-    print(f"🔍 [bconnect] Текущие связи в базе для {source.id}: {current_targets}")
+    key = f"bridge:{source_id_str}"
     
-    if target_id_str in current_targets:
-        await interaction.followup.send("⚠️ Мост уже существует!")
-        return
+    try:
+        current_targets_raw = await redis.lrange(key, 0, -1) or []
+        current_targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in current_targets_raw]
+        
+        if target_id_str in current_targets:
+            await interaction.followup.send(f"⚠️ Мост между {source.mention} и {target.mention} уже существует!")
+            return
 
-    # Записываем строго как строку
-    await redis.rpush(key, target_id_str)
-    await interaction.followup.send(f"✅ Связано: {source.mention} -> {target.mention}")
+        await redis.rpush(key, target_id_str)
+        await interaction.followup.send(f"✅ Успешно создан мост:\n📥 Из: {source.mention}\n📤 В: {target.mention}")
+    except Exception as e:
+        print(f"🔴 Ошибка внутри bconnect: {e}")
+        await interaction.followup.send(f"❌ Ошибка базы данных: {e}")
 
-# СЛЭШ-КОМАНДА: Удалить связь
-@bot.tree.command(name="bdisconnect", description="Удалить связь")
+# СЛЭШ-КОМАНДА: Разорвать связь
+@bot.tree.command(name="bdisconnect", description="Удалить связь между каналами")
 @app_commands.checks.has_permissions(administrator=True)
 async def bdisconnect(interaction: discord.Interaction, source: discord.TextChannel, target: discord.TextChannel):
     await interaction.response.defer(ephemeral=True)
     
-    key = f"bridge:{source.id}"
+    source_id_str = str(source.id)
     target_id_str = str(target.id)
     
-    # Удаляем оба возможных варианта (строку и байты), чтобы наверняка очистить кэш
-    await redis.lrem(key, 0, target_id_str)
-    await redis.lrem(key, 0, target_id_str.encode('utf-8'))
+    key = f"bridge:{source_id_str}"
     
-    await interaction.followup.send("❌ Связь удалена.")
+    try:
+        await redis.lrem(key, 0, target_id_str)
+        await redis.lrem(key, 0, target_id_str.encode('utf-8'))
+        await interaction.followup.send(f"❌ Мост между {source.mention} и {target.mention} успешно удален!")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Ошибка удаления: {e}")
 
 @bot.event
 async def on_message(message: discord.Message):
