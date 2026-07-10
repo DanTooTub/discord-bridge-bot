@@ -1,83 +1,132 @@
 import os
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 import asyncio
 from aiohttp import web
+from upstash_redis.asyncio import Redis
 
-# Загружаем переменные
+# Загружаем переменные окружения
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(BASE_DIR, "variables.env")
 load_dotenv(dotenv_path=env_path)
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-SOURCE_CHANNEL_ID_RAW = os.getenv("SOURCE_CHANNEL_ID")
-TARGET_CHANNEL_ID_RAW = os.getenv("TARGET_CHANNEL_ID")
+REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
-if not TOKEN or not SOURCE_CHANNEL_ID_RAW or not TARGET_CHANNEL_ID_RAW:
-    print("❌ Ошибка загрузки переменных окружения!")
+if not TOKEN or not REDIS_URL or not REDIS_TOKEN:
+    print("❌ Ошибка: Убедись, что DISCORD_TOKEN, UPSTASH_REDIS_REST_URL и UPSTASH_REDIS_REST_TOKEN заданы!")
     exit(1)
 
-SOURCE_CHANNEL_ID = int(SOURCE_CHANNEL_ID_RAW)
-TARGET_CHANNEL_ID = int(TARGET_CHANNEL_ID_RAW)
+# Инициализируем асинхронный клиент Upstash Redis
+redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
 
+# Настройка бота со слэш-командами
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-cached_webhook = None
+cached_webhooks = {}
 
-# Функция поиска или создания вебхука в целевом канале
+# Поиск или динамическое создание вебхука в целевом канале
 async def get_target_webhook(channel):
-    global cached_webhook
-    if cached_webhook:
-        return cached_webhook
+    if channel.id in cached_webhooks:
+        return cached_webhooks[channel.id]
     try:
         webhooks = await channel.webhooks()
         for wh in webhooks:
-            if wh.name == "Bridge Webhook":
-                cached_webhook = wh
-                return cached_webhook
-        cached_webhook = await channel.create_webhook(name="Bridge Webhook")
-        return cached_webhook
-    except discord.Forbidden:
-        print(f"⚠️ Нет прав на управление вебхуками в канале {channel.id}!")
-        return None
+            if wh.name == f"Bridge-{channel.id}":
+                cached_webhooks[channel.id] = wh
+                return wh
+        wh = await channel.create_webhook(name=f"Bridge-{channel.id}")
+        cached_webhooks[channel.id] = wh
+        return wh
     except Exception as e:
-        print(f"Ошибка вебхука: {e}")
+        print(f"🔴 Ошибка вебхука в канале {channel.id}: {e}")
         return None
 
-# Простейший веб-обработчик для UptimeRobot
+# Хендлер веб-сервера для Render / UptimeRobot
 async def handle(request):
-    return web.Response(text="Бот Пересыльщик активен и работает на Render!")
+    return web.Response(text="Мультисерверный мост на Upstash Redis активен!")
 
 @bot.event
 async def on_ready():
-    print(f"✅ Бот успешно авторизован как: {bot.user.name}")
-    print("🚀 МОСТ С УМНОЙ ФИЛЬТРАЦИЕЙ БОТОВ ЗАПУЩЕН!")
+    print(f"✅ Бот авторизован как: {bot.user.name}")
+    try:
+        synced = await bot.tree.sync()
+        print(f"🔮 Синхронизировано слэш-команд: {len(synced)}")
+    except Exception as e:
+        print(f"🔴 Ошибка синхронизации команд: {e}")
+
+# СЛЭШ-КОМАНДА: Связать каналы
+@bot.tree.command(name="bconnect", description="Связать исходный канал с целевым")
+@app_commands.describe(source="Канал, ОТКУДА забирать сообщения", target="Канал, КУДА пересылать сообщения")
+@app_commands.checks.has_permissions(administrator=True)
+async def bconnect(interaction: discord.Interaction, source: discord.TextChannel, target: discord.TextChannel):
+    await interaction.response.defer(ephemeral=True)
+    
+    key = f"bridge:{source.id}"
+    target_id_str = str(target.id)
+    
+    # Получаем текущий список целей для этого канала из Redis
+    current_targets = await redis.lrange(key, 0, -1)
+    
+    if current_targets and target_id_str in current_targets:
+        await interaction.followup.send(f"⚠️ Мост между {source.mention} и {target.mention} уже существует!")
+        return
+
+    # Записываем ID целевого канала в список Redis
+    await redis.rpush(key, target_id_str)
+    
+    await interaction.followup.send(f"✅ Успешно создан мост:\n📥 Из: {source.mention}\n📤 В: {target.mention}")
+
+# СЛЭШ-КОМАНДА: Разорвать связь
+@bot.tree.command(name="bdisconnect", description="Удалить связь между каналами")
+@app_commands.checks.has_permissions(administrator=True)
+async def bdisconnect(interaction: discord.Interaction, source: discord.TextChannel, target: discord.TextChannel):
+    await interaction.response.defer(ephemeral=True)
+    
+    key = f"bridge:{source.id}"
+    target_id_str = str(target.id)
+    
+    # Удаляем конкретный target_id из списка в Redis (0 означает удалить все совпадения)
+    deleted_count = await redis.lrem(key, 0, target_id_str)
+    
+    if deleted_count > 0:
+        await interaction.followup.send(f"❌ Мост между {source.mention} и {target.mention} успешно удален!")
+    else:
+        await interaction.followup.send(f"⚠️ Связь между этими каналами не найдена в Redis.")
 
 @bot.event
 async def on_message(message: discord.Message):
-    # УМНАЯ ЗАЩИТА ОТ ЗАЦИКЛИВАНИЯ:
-    # 1. Игнорируем сообщения от нашего собственного аккаунта бота
     if message.author == bot.user:
         return
 
-    # 2. Игнорируем только НАШ вебхук (чтобы не было бесконечного спама)
-    global cached_webhook
-    if cached_webhook and message.webhook_id == cached_webhook.id:
+    # Защита от зацикливания собственных вебхуков бота
+    if message.webhook_id and message.webhook_id in [wh.id for wh in cached_webhooks.values()]:
         return
 
-    # Проверяем канал отправки (теперь сообщения других ботов и чужие вебхуки пройдут!)
-    if message.channel.id == SOURCE_CHANNEL_ID:
-        target_channel = bot.get_channel(TARGET_CHANNEL_ID)
-        if target_channel is None:
-            try: 
-                target_channel = await bot.fetch_channel(TARGET_CHANNEL_ID)
-            except: 
-                return
+    # Проверяем в Redis, привязаны ли получатели к каналу, откуда пришло сообщение
+    key = f"bridge:{message.channel.id}"
+    target_channels_data = await redis.lrange(key, 0, -1)
 
-        # Скачиваем вложения, если они есть
+    if not target_channels_data:
+        return
+
+    for target_id_bytes in target_channels_data:
+        # Приводим полученные данные к числу ID
+        target_id = int(target_id_bytes)
+        
+        target_channel = bot.get_channel(target_id)
+        if not target_channel:
+            try:
+                target_channel = await bot.fetch_channel(target_id)
+            except:
+                continue
+
+        # Собираем вложения (картинки, файлы), если они есть
         files = []
         if message.attachments:
             for attachment in message.attachments:
@@ -86,28 +135,24 @@ async def on_message(message: discord.Message):
                 except: 
                     pass
 
-        # Копируем аватарку, ник и добавляем имя сервера
+        # Формируем имя отправителя и сервер назначения
         guild_name = f" [{message.guild.name}]" if message.guild else ""
         display_name = f"{message.author.display_name}{guild_name}"
         avatar_url = message.author.display_avatar.url if message.author.display_avatar else None
 
-        # Стучимся за вебхуком
         webhook = await get_target_webhook(target_channel)
-
         try:
             if webhook:
-                # Фикс для Эмбедов: глубокое копирование структур
                 webhook_embeds = []
                 if message.embeds:
                     for emb in message.embeds:
                         webhook_embeds.append(discord.Embed.from_dict(emb.to_dict()))
 
                 content = message.content if message.content else None
-                
-                # Если это чужой бот без аватарки, ставим заглушку, чтобы Discord API не ругался
                 if not avatar_url:
                     avatar_url = webhook.url
 
+                # Если есть хоть какой-то контент — отправляем через вебхук
                 if content or files or webhook_embeds:
                     await webhook.send(
                         content=content,
@@ -116,28 +161,13 @@ async def on_message(message: discord.Message):
                         embeds=webhook_embeds if webhook_embeds else discord.utils.MISSING,
                         files=files if files else discord.utils.MISSING
                     )
-            else:
-                # Резервный вариант без вебхука
-                backup_embeds = []
-                if message.embeds:
-                    for emb in message.embeds:
-                        backup_embeds.append(discord.Embed.from_dict(emb.to_dict()))
-
-                if backup_embeds:
-                    await target_channel.send(embed=backup_embeds[0], files=files if files else None)
-                else:
-                    clean_text = f"**{display_name}:** {message.content}"
-                    if message.content or files:
-                        await target_channel.send(
-                            content=clean_text if message.content else f"**{display_name}** прикрепил файлы:", 
-                            files=files if files else None
-                        )
         except Exception as e:
-            print(f"🔴 Ошибка отправки: {e}")
+            print(f"🔴 Ошибка пересылки в целевой канал {target_id}: {e}")
 
     await bot.process_commands(message)
 
 async def main():
+    # Запуск веб-сервера aiohttp для прохождения проверок Render
     app = web.Application()
     app.router.add_get('/', handle)
     runner = web.AppRunner(app)
@@ -145,7 +175,7 @@ async def main():
     
     site = web.TCPSite(runner, '0.0.0.0', 10000)
     await site.start()
-    print("🌐 Наземный веб-сервер aiohttp успешно открыл порт 10000!")
+    print("🌐 HTTP-сервер запущен на порту 10000")
 
     try:
         await bot.start(TOKEN)
