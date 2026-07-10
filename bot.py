@@ -4,6 +4,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 import asyncio
+import re
 from aiohttp import web
 from upstash_redis.asyncio import Redis
 
@@ -28,6 +29,13 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 cached_webhooks = {}
+
+# Регулярка для извлечения чистых цифр ID из тегов вида <#123456789> или сырых строк
+def extract_id(channel_mention: str) -> int:
+    match = re.search(r'\d+', channel_mention)
+    if match:
+        return int(match.group())
+    raise ValueError("Не удалось извлечь корректный ID канала.")
 
 async def get_target_webhook(channel):
     if channel.id in cached_webhooks:
@@ -55,50 +63,60 @@ async def on_ready():
         synced = await bot.tree.sync()
         print(f"🔮 Синхронизировано слэш-команд: {len(synced)}")
     except Exception as e:
-        print(f"🔴 Ошибка синхронизации команд в Discord API: {e}")
+        print(f"🔴 Ошибка синхронизации команд: {e}")
 
-# СЛЭШ-КОМАНДА: Связать каналы
-@bot.tree.command(name="bconnect", description="Связать исходный канал с целевым")
-@app_commands.describe(source="Канал, ОТКУДА забирать сообщения", target="Канал, КУДА пересылать сообщения")
+# СЛЭШ-КОМАНДА: Связать каналы (Параметры изменены на типы str!)
+@bot.tree.command(name="bconnect", description="Связать каналы с помощью упоминаний или ID")
+@app_commands.describe(source="Упомяните канал через # (например, #канал-откуда)", target="Упомяните канал через # (например, #канал-куда)")
 @app_commands.checks.has_permissions(administrator=True)
-async def bconnect(interaction: discord.Interaction, source: discord.TextChannel, target: discord.TextChannel):
+async def bconnect(interaction: discord.Interaction, source: str, target: str):
+    # defer() спасает от ошибки "Приложение не отвечает", давая боту 15 минут на размышления
     await interaction.response.defer(ephemeral=True)
     
-    # Берем ID напрямую из свойств объекта, принудительно превращая в строку
-    source_id_str = str(source.id)
-    target_id_str = str(target.id)
-    
-    key = f"bridge:{source_id_str}"
+    try:
+        source_id = extract_id(source)
+        target_id = extract_id(target)
+    except ValueError:
+        await interaction.followup.send("❌ Ошибка: неверный формат каналов. Используйте упоминания через #.")
+        return
+
+    key = f"bridge:{source_id}"
+    target_id_str = str(target_id)
     
     try:
         current_targets_raw = await redis.lrange(key, 0, -1) or []
         current_targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in current_targets_raw]
         
         if target_id_str in current_targets:
-            await interaction.followup.send(f"⚠️ Мост между {source.mention} и {target.mention} уже существует!")
+            await interaction.followup.send("⚠️ Этот мост уже настроен и существует!")
             return
 
         await redis.rpush(key, target_id_str)
-        await interaction.followup.send(f"✅ Успешно создан мост:\n📥 Из: {source.mention}\n📤 В: {target.mention}")
+        await interaction.followup.send(f"✅ Успешно связан мост между каналами!")
     except Exception as e:
-        print(f"🔴 Ошибка внутри bconnect: {e}")
-        await interaction.followup.send(f"❌ Ошибка базы данных: {e}")
+        print(f"🔴 Ошибка базы данных в bconnect: {e}")
+        await interaction.followup.send(f"❌ Системная ошибка при работе с Redis: {e}")
 
-# СЛЭШ-КОМАНДА: Разорвать связь
+# СЛЭШ-КОМАНДА: Удалить связь
 @bot.tree.command(name="bdisconnect", description="Удалить связь между каналами")
 @app_commands.checks.has_permissions(administrator=True)
-async def bdisconnect(interaction: discord.Interaction, source: discord.TextChannel, target: discord.TextChannel):
+async def bdisconnect(interaction: discord.Interaction, source: str, target: str):
     await interaction.response.defer(ephemeral=True)
     
-    source_id_str = str(source.id)
-    target_id_str = str(target.id)
-    
-    key = f"bridge:{source_id_str}"
+    try:
+        source_id = extract_id(source)
+        target_id = extract_id(target)
+    except ValueError:
+        await interaction.followup.send("❌ Ошибка: неверный формат каналов.")
+        return
+        
+    key = f"bridge:{source_id}"
+    target_id_str = str(target_id)
     
     try:
         await redis.lrem(key, 0, target_id_str)
         await redis.lrem(key, 0, target_id_str.encode('utf-8'))
-        await interaction.followup.send(f"❌ Мост между {source.mention} и {target.mention} успешно удален!")
+        await interaction.followup.send("❌ Мост успешно удален из базы данных.")
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка удаления: {e}")
 
@@ -117,7 +135,6 @@ async def on_message(message: discord.Message):
         return
 
     for target_id_raw in target_channels_data:
-        # Максимально агрессивная очистка ID от байтовых оберток
         try:
             if isinstance(target_id_raw, bytes):
                 target_id_str = target_id_raw.decode('utf-8').strip("'\" ")
@@ -156,7 +173,6 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 async def main():
-    # Запуск веб-сервера aiohttp для прохождения проверок Render
     app = web.Application()
     app.router.add_get('/', handle)
     runner = web.AppRunner(app)
