@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 import asyncio
 import re
 from aiohttp import web
-# Правильный импорт асинхронного клиента Upstash
 from upstash_redis.asyncio import Redis
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -21,7 +20,6 @@ if not TOKEN or not REDIS_URL or not REDIS_TOKEN:
     print("❌ Ошибка переменных окружения!")
     exit(1)
 
-# Инициализируем Redis
 redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
 
 intents = discord.Intents.default()
@@ -64,26 +62,28 @@ async def on_ready():
     except Exception as e:
         print(f"🔴 Ошибка синхронизации: {e}")
 
-# СЛЭШ-КОМАНДА: Связать каналы
-@bot.tree.command(name="bconnect", description="Связать каналы (введите ID или #канал)")
-@app_commands.describe(source="ID или #канал откуда", target="ID или #канал куда")
-@app_commands.checks.has_permissions(administrator=True)
+# МАКСИМАЛЬНО ГОЛАЯ КОМАНДА: Без describe и лишних проверок в декораторах
+@bot.tree.command(name="bconnect")
 async def bconnect(interaction: discord.Interaction, source: str, target: str):
-    # ПЕРВЫМ ДЕЛОМ: Моментально отвечаем Дискорду, чтобы убрать ошибку тайм-аута
+    # Моментальный ответ Дискорду в первую же микросекунду
     await interaction.response.defer(ephemeral=True)
+    
+    # Ручная проверка прав, чтобы разгрузить Discord API
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ У вас должны быть права администратора!")
+        return
     
     try:
         source_id = extract_id(source)
         target_id = extract_id(target)
     except ValueError:
-        await interaction.followup.send("❌ Ошибка: Укажите корректные ID каналов (цифрами или через #).")
+        await interaction.followup.send("❌ Укажите корректные ID каналов цифрами.")
         return
 
     key = f"bridge:{source_id}"
     target_id_str = str(target_id)
     
     try:
-        # Запрашиваем Redis
         current_targets_raw = await redis.lrange(key, 0, -1) or []
         current_targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in current_targets_raw]
         
@@ -92,17 +92,19 @@ async def bconnect(interaction: discord.Interaction, source: str, target: str):
             return
 
         await redis.rpush(key, target_id_str)
-        await interaction.followup.send(f"✅ Мост успешно создан! Из `{source_id}` в `{target_id}`.")
+        await interaction.followup.send(f"✅ Успешно связан мост! `{source_id}` -> `{target_id}`")
     except Exception as e:
         print(f"🔴 Ошибка Redis: {e}")
-        await interaction.followup.send(f"❌ База данных не ответила. Проверьте логи Render.")
+        await interaction.followup.send("❌ База данных во Франкфурте легла или не ответила.")
 
-# СЛЭШ-КОМАНДА: Удалить связь
-@bot.tree.command(name="bdisconnect", description="Удалить связь")
-@app_commands.checks.has_permissions(administrator=True)
+@bot.tree.command(name="bdisconnect")
 async def bdisconnect(interaction: discord.Interaction, source: str, target: str):
     await interaction.response.defer(ephemeral=True)
     
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ Нет прав.")
+        return
+        
     try:
         source_id = extract_id(source)
         target_id = extract_id(target)
