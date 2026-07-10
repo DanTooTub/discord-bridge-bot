@@ -17,7 +17,7 @@ REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
 if not TOKEN or not REDIS_URL or not REDIS_TOKEN:
-    print("❌ Ошибка: Убедись, что переменные окружения заданы!")
+    print("❌ Ошибка: Убедись, что переменные окружения заданы в Render!")
     exit(1)
 
 # Инициализируем клиент Redis
@@ -51,8 +51,13 @@ async def handle(request):
 @bot.event
 async def on_ready():
     print(f"✅ Бот авторизован: {bot.user.name}")
-    await bot.tree.sync()
+    try:
+        synced = await bot.tree.sync()
+        print(f"🔮 Синхронизировано слэш-команд: {len(synced)}")
+    except Exception as e:
+        print(f"🔴 Ошибка синхронизации команд в Discord API: {e}")
 
+# СЛЭШ-КОМАНДА: Связать каналы
 @bot.tree.command(name="bconnect", description="Связать каналы")
 @app_commands.checks.has_permissions(administrator=True)
 async def bconnect(interaction: discord.Interaction, source: discord.TextChannel, target: discord.TextChannel):
@@ -61,17 +66,26 @@ async def bconnect(interaction: discord.Interaction, source: discord.TextChannel
     key = f"bridge:{source.id}"
     target_id_str = str(target.id)
     
-    current_targets_raw = await redis.lrange(key, 0, -1)
-    # Декодируем байты из Redis в строки
-    current_targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in current_targets_raw]
+    # Извлекаем данные и гарантированно переводим каждую запись в стандартную строку
+    current_targets_raw = await redis.lrange(key, 0, -1) or []
+    current_targets = []
+    for t in current_targets_raw:
+        if isinstance(t, bytes):
+            current_targets.append(t.decode('utf-8'))
+        else:
+            current_targets.append(str(t))
+            
+    print(f"🔍 [bconnect] Текущие связи в базе для {source.id}: {current_targets}")
     
     if target_id_str in current_targets:
         await interaction.followup.send("⚠️ Мост уже существует!")
         return
 
+    # Записываем строго как строку
     await redis.rpush(key, target_id_str)
     await interaction.followup.send(f"✅ Связано: {source.mention} -> {target.mention}")
 
+# СЛЭШ-КОМАНДА: Удалить связь
 @bot.tree.command(name="bdisconnect", description="Удалить связь")
 @app_commands.checks.has_permissions(administrator=True)
 async def bdisconnect(interaction: discord.Interaction, source: discord.TextChannel, target: discord.TextChannel):
@@ -80,6 +94,7 @@ async def bdisconnect(interaction: discord.Interaction, source: discord.TextChan
     key = f"bridge:{source.id}"
     target_id_str = str(target.id)
     
+    # Удаляем оба возможных варианта (строку и байты), чтобы наверняка очистить кэш
     await redis.lrem(key, 0, target_id_str)
     await redis.lrem(key, 0, target_id_str.encode('utf-8'))
     
@@ -100,40 +115,53 @@ async def on_message(message: discord.Message):
         return
 
     for target_id_raw in target_channels_data:
+        # Максимально агрессивная очистка ID от байтовых оберток
         try:
-            # Исправленное декодирование байтов
             if isinstance(target_id_raw, bytes):
-                target_id = int(target_id_raw.decode('utf-8'))
+                target_id_str = target_id_raw.decode('utf-8').strip("'\" ")
             else:
-                target_id = int(target_id_raw)
-        except (ValueError, TypeError):
+                target_id_str = str(target_id_raw).strip("'\" ")
+            
+            target_id = int(target_id_str)
+        except Exception as e:
+            print(f"🔴 Ошибка конвертации ID из базы ({target_id_raw}): {e}")
             continue
         
         target_channel = bot.get_channel(target_id)
         if not target_channel:
-            try: target_channel = await bot.fetch_channel(target_id)
-            except: continue
+            try: 
+                target_channel = await bot.fetch_channel(target_id)
+            except Exception as e: 
+                print(f"🔴 Дискорд не нашёл канал с ID {target_id}: {e}")
+                continue
 
         files = [await a.to_file() for a in message.attachments]
         webhook = await get_target_webhook(target_channel)
         
         if webhook:
-            await webhook.send(
-                content=message.content or None,
-                username=f"{message.author.display_name} [{message.guild.name}]",
-                avatar_url=message.author.display_avatar.url,
-                embeds=[discord.Embed.from_dict(e.to_dict()) for e in message.embeds],
-                files=files or discord.utils.MISSING
-            )
+            try:
+                guild_name = f" [{message.guild.name}]" if message.guild else ""
+                await webhook.send(
+                    content=message.content or None,
+                    username=f"{message.author.display_name}{guild_name}",
+                    avatar_url=message.author.display_avatar.url,
+                    embeds=[discord.Embed.from_dict(e.to_dict()) for e in message.embeds],
+                    files=files or discord.utils.MISSING
+                )
+            except Exception as e:
+                print(f"🔴 Ошибка отправки вебхука в {target_id}: {e}")
 
     await bot.process_commands(message)
 
 async def main():
+    # Запуск веб-сервера aiohttp для прохождения проверок Render
     app = web.Application()
     app.router.add_get('/', handle)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', 10000).start()
+    
+    print("🌐 HTTP-сервер запущен на порту 10000")
     await bot.start(TOKEN)
 
 if __name__ == '__main__':
