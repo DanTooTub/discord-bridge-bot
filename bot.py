@@ -79,12 +79,12 @@ async def on_ready():
         print(f"🔴 Ошибка синхронизации: {e}")
 
 # ================= КОМАНДА: /bcreate =================
-@bot.tree.command(name="bcreate", description="Создать мост (single) или инициализировать кросс-сеть (cross)")
+@bot.tree.command(name="bcreate", description="Создать мост трансляции (single) или глобальную сеть чатов (cross)")
 @app_commands.choices(mode=[
     app_commands.Choice(name="single", value="single"),
     app_commands.Choice(name="cross", value="cross")
 ])
-async def bcreate(interaction: discord.Interaction, mode: str, source: str = None, target: str = None, name: str = None):
+async def bcreate(interaction: discord.Interaction, mode: str, source: str = None, name: str = None):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
         return
@@ -92,29 +92,32 @@ async def bcreate(interaction: discord.Interaction, mode: str, source: str = Non
     await interaction.response.defer(ephemeral=True)
 
     if mode == "single":
-        if not source or not target:
-            await interaction.followup.send("❌ Для режима single необходимо указать source и target!")
+        if not source:
+            await interaction.followup.send("❌ Для режима single необходимо указать source (ID канала-источника)!")
             return
         try:
             source_id = extract_id(source)
-            target_id = extract_id(target)
         except ValueError:
-            await interaction.followup.send("❌ Укажите корректные ID каналов.")
+            await interaction.followup.send("❌ Укажите корректный ID канала-источника.")
             return
 
-        key = f"bridge:{source_id}"
-        target_id_str = str(target_id)
-        
+        source_id_str = str(source_id)
+        # Соответствует твоей старой базе: bridge:ID
+        bridge_key = f"bridge:{source_id_str}"
+        meta_key = f"bridgemeta:{source_id_str}"
+
         try:
-            current_targets_raw = await redis.lrange(key, 0, -1) or []
-            current_targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in current_targets_raw]
-            
-            if target_id_str in current_targets:
-                await interaction.followup.send("⚠️ Этот обычный мост уже существует!")
+            exists = await redis.exists(meta_key)
+            if exists:
+                await interaction.followup.send(f"⚠️ Мост для источника `{source_id_str}` уже инициализирован!")
                 return
 
-            await redis.rpush(key, target_id_str)
-            await interaction.followup.send(f"✅ Обычный мост создан! `{source_id}` -> `{target_id}`")
+            await redis.set(meta_key, "single")
+            # Создаем пустой список или маркер, если ключа bridge: еще нет
+            if not await redis.exists(bridge_key):
+                await redis.rpush(bridge_key, "INIT_MARKER")
+
+            await interaction.followup.send(f"📈 Мост трансляции создан! Перейдите в целевой канал и вызовите `/bconnect bname:{source_id_str}`")
         except Exception as e:
             await interaction.followup.send(f"❌ Ошибка Redis: {e}")
 
@@ -124,57 +127,114 @@ async def bcreate(interaction: discord.Interaction, mode: str, source: str = Non
             return
         
         safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', name).lower()
-        net_key = f"crossnet:{safe_name}"
-        
+        meta_key = f"bridgemeta:{safe_name}"
+
         try:
-            exists = await redis.exists(net_key)
+            exists = await redis.exists(meta_key)
             if exists:
                 await interaction.followup.send(f"⚠️ Кросс-мост с именем `{safe_name}` уже существует!")
                 return
-                
+
+            await redis.set(meta_key, "cross")
+            net_key = f"crossnet:{safe_name}"
             await redis.rpush(net_key, "INIT_MARKER")
-            await interaction.followup.send(f"👑 Кросс-мост чатов `{safe_name}` успешно инициализирован! Используйте `/bconnect` для добавления каналов.")
+            await interaction.followup.send(f"👑 Кросс-мост чатов `{safe_name}` создан! Используйте `/bconnect bname:{safe_name}` для привязки каналов.")
         except Exception as e:
-            await interaction.followup.send(f"❌ Ошибка создания кросс-моста: {e}")
+            await interaction.followup.send(f"❌ Ошибка Redis: {e}")
 
 # ================= КОМАНДА: /bconnect =================
-@bot.tree.command(name="bconnect", description="Подключить канал к существующему кросс-мосту")
-async def bconnect(interaction: discord.Interaction, bname: str, channel: str):
+@bot.tree.command(name="bconnect", description="Подключить текущий канал к мосту (введите имя кросс-моста или ID источника)")
+async def bconnect(interaction: discord.Interaction, bname: str):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
-        
-    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', bname).lower()
-    net_key = f"crossnet:{safe_name}"
+    safe_bname = re.sub(r'[^a-zA-Z0-9_-]', '', bname).lower()
+    current_channel_id_str = str(interaction.channel_id)
     
     try:
-        channel_id = extract_id(channel)
-    except ValueError:
-        await interaction.followup.send("❌ Укажите корректный ID канала.")
-        return
+        # Проверяем тип моста в метаданных
+        mode_raw = await redis.get(f"bridgemeta:{safe_bname}")
         
-    try:
-        exists = await redis.exists(net_key)
-        if not exists:
-            await interaction.followup.send(f"❌ Кросс-моста с именем `{safe_name}` не существует! Сначала создайте его через `/bcreate`.")
+        # Запасной вариант для обратной совместимости: если в метаданных нет, но старый ключ bridge:ID существует
+        if not mode_raw and await redis.exists(f"bridge:{safe_bname}"):
+            mode = "single"
+            await redis.set(f"bridgemeta:{safe_bname}", "single") # Лечим базу на лету
+        elif mode_raw:
+            mode = mode_raw.decode('utf-8') if isinstance(mode_raw, bytes) else str(mode_raw)
+        else:
+            await interaction.followup.send(f"❌ Моста или источника со значением `{safe_bname}` не существует!")
             return
+
+        if mode == "single":
+            bridge_key = f"bridge:{safe_bname}"
             
-        channel_id_str = str(channel_id)
-        current_channels_raw = await redis.lrange(net_key, 0, -1) or []
-        current_channels = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in current_channels_raw]
-        
-        if channel_id_str in current_channels:
-            await interaction.followup.send(f"⚠️ Этот канал уже подключен к мосту `{safe_name}`!")
-            return
+            current_targets_raw = await redis.lrange(bridge_key, 0, -1) or []
+            current_targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in current_targets_raw]
             
-        await redis.rpush(net_key, channel_id_str)
-        await redis.set(f"channelnet:{channel_id_str}", safe_name)
-        
-        await interaction.followup.send(f"🔗 Канал `{channel_id}` успешно подключен к глобальному кросс-мосту `{safe_name}`!")
+            if current_channel_id_str in current_targets:
+                await interaction.followup.send(f"⚠️ Этот канал уже принимает трансляцию из источника `{safe_bname}`!")
+                return
+                
+            await redis.rpush(bridge_key, current_channel_id_str)
+            await interaction.followup.send(f"✅ Готово! Текущий канал теперь привязан и получает трансляцию из <#{safe_bname}>")
+
+        elif mode == "cross":
+            net_key = f"crossnet:{safe_bname}"
+            current_channels_raw = await redis.lrange(net_key, 0, -1) or []
+            current_channels = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in current_channels_raw]
+            
+            if current_channel_id_str in current_channels:
+                await interaction.followup.send(f"⚠️ Этот канал уже подключен к кросс-мосту `{safe_bname}`!")
+                return
+                
+            await redis.rpush(net_key, current_channel_id_str)
+            await redis.sadd(f"crosschannels:{current_channel_id_str}", safe_bname)
+            await interaction.followup.send(f"🔗 Текущий канал успешно подключен к глобальному кросс-мосту `{safe_bname}`!")
+
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка подключения: {e}")
+
+# ================= КОМАНДА: /bdelete =================
+@bot.tree.command(name="bdelete", description="Полностью удалить мост (введите имя кросс-моста или ID источника)")
+async def bdelete(interaction: discord.Interaction, name: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', name).lower()
+
+    try:
+        mode_raw = await redis.get(f"bridgemeta:{safe_name}")
+        
+        # Поддержка старых single-ключей при удалении
+        if not mode_raw and await redis.exists(f"bridge:{safe_name}"):
+            mode = "single"
+        elif mode_raw:
+            mode = mode_raw.decode('utf-8') if isinstance(mode_raw, bytes) else str(mode_raw)
+        else:
+            await interaction.followup.send(f"❌ Моста или источника со значением `{safe_name}` не существует.")
+            return
+
+        if mode == "single":
+            await redis.delete(f"bridge:{safe_name}")
+            
+        elif mode == "cross":
+            net_key = f"crossnet:{safe_name}"
+            channels_raw = await redis.lrange(net_key, 0, -1) or []
+            for c_raw in channels_raw:
+                c_str = c_raw.decode('utf-8') if isinstance(c_raw, bytes) else str(c_raw)
+                if c_str != "INIT_MARKER":
+                    await redis.srem(f"crosschannels:{c_str}", safe_name)
+            await redis.delete(net_key)
+
+        await redis.delete(f"bridgemeta:{safe_name}")
+        await interaction.followup.send(f"🗑️ Мост `{safe_name}` (тип: {mode}) успешно удален из системы!")
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Ошибка при удалении моста: {e}")
 
 # ================= ОБРАБОТКА СООБЩЕНИЙ =================
 @bot.event
@@ -188,33 +248,36 @@ async def on_message(message: discord.Message):
     current_channel_id_str = str(message.channel.id)
     targets_to_send = set()
 
-    # --- ЛОГИКА 1: Проверяем обычные мосты (Single) ---
+    # --- ЛОГИКА 1: Проверяем классические мосты (Single) по твоей структуре ---
     single_key = f"bridge:{current_channel_id_str}"
     single_targets_raw = await redis.lrange(single_key, 0, -1)
     if single_targets_raw:
         for t_raw in single_targets_raw:
             try:
                 t_str = t_raw.decode('utf-8').strip("'\" ") if isinstance(t_raw, bytes) else str(t_raw).strip("'\" ")
+                if t_str == "INIT_MARKER":
+                    continue
                 targets_to_send.add(int(t_str))
             except:
                 continue
 
     # --- ЛОГИКА 2: Проверяем кросс-мосты (Cross) ---
-    cross_net_name_raw = await redis.get(f"channelnet:{current_channel_id_str}")
-    if cross_net_name_raw:
-        cross_net_name = cross_net_name_raw.decode('utf-8') if isinstance(cross_net_name_raw, bytes) else str(cross_net_name_raw)
-        cross_targets_raw = await redis.lrange(f"crossnet:{cross_net_name}", 0, -1) or []
-        
-        for t_raw in cross_targets_raw:
-            try:
-                t_str = t_raw.decode('utf-8').strip("'\" ") if isinstance(t_raw, bytes) else str(t_raw).strip("'\" ")
-                if t_str == "INIT_MARKER":
-                    continue
-                t_id = int(t_str)
-                if t_id != message.channel.id:
-                    targets_to_send.add(t_id)
-            except:
-                continue
+    active_cross_bridges = await redis.smembers(f"crosschannels:{current_channel_id_str}")
+    if active_cross_bridges:
+        for b_bytes in active_cross_bridges:
+            b_name = b_bytes.decode('utf-8') if isinstance(b_bytes, bytes) else str(b_bytes)
+            if await redis.exists(f"bridgemeta:{b_name}"):
+                cross_targets_raw = await redis.lrange(f"crossnet:{b_name}", 0, -1) or []
+                for t_raw in cross_targets_raw:
+                    try:
+                        t_str = t_raw.decode('utf-8').strip("'\" ") if isinstance(t_raw, bytes) else str(t_raw).strip("'\" ")
+                        if t_str == "INIT_MARKER":
+                            continue
+                        t_id = int(t_str)
+                        if t_id != message.channel.id:
+                            targets_to_send.add(t_id)
+                    except:
+                        continue
 
     # --- ОТПРАВКА СООБЩЕНИЙ ВО ВСЕ НАЙДЕННЫЕ ТАРГЕТЫ ---
     if targets_to_send:
