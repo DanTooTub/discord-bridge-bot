@@ -78,109 +78,169 @@ async def on_ready():
     except Exception as e:
         print(f"🔴 Ошибка синхронизации: {e}")
 
-# МАКСИМАЛЬНО ГОЛАЯ КОМАНДА: Без describe и лишних проверок в декораторах
-@bot.tree.command(name="bconnect")
-async def bconnect(interaction: discord.Interaction, source: str, target: str):
-    # Моментальный ответ Дискорду в первую же микросекунду
-    await interaction.response.defer(ephemeral=True)
-    
-    # Ручная проверка прав, чтобы разгрузить Discord API
+# ================= КОМАНДА: /bcreate =================
+@bot.tree.command(name="bcreate", description="Создать мост (single) или инициализировать кросс-сеть (cross)")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="single", value="single"),
+    app_commands.Choice(name="cross", value="cross")
+])
+async def bcreate(interaction: discord.Interaction, mode: str, source: str = None, target: str = None, name: str = None):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.followup.send("❌ У вас должны быть права администратора!")
-        return
-    
-    try:
-        source_id = extract_id(source)
-        target_id = extract_id(target)
-    except ValueError:
-        await interaction.followup.send("❌ Укажите корректные ID каналов цифрами.")
+        await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
         return
 
-    key = f"bridge:{source_id}"
-    target_id_str = str(target_id)
-    
-    try:
-        current_targets_raw = await redis.lrange(key, 0, -1) or []
-        current_targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in current_targets_raw]
-        
-        if target_id_str in current_targets:
-            await interaction.followup.send("⚠️ Этот мост уже существует!")
+    await interaction.response.defer(ephemeral=True)
+
+    if mode == "single":
+        if not source or not target:
+            await interaction.followup.send("❌ Для режима single необходимо указать source и target!")
+            return
+        try:
+            source_id = extract_id(source)
+            target_id = extract_id(target)
+        except ValueError:
+            await interaction.followup.send("❌ Укажите корректные ID каналов.")
             return
 
-        await redis.rpush(key, target_id_str)
-        await interaction.followup.send(f"✅ Успешно связан мост! `{source_id}` -> `{target_id}`")
-    except Exception as e:
-        print(f"🔴 Ошибка Redis: {e}")
-        await interaction.followup.send("❌ База данных во Франкфурте легла или не ответила.")
+        key = f"bridge:{source_id}"
+        target_id_str = str(target_id)
+        
+        try:
+            current_targets_raw = await redis.lrange(key, 0, -1) or []
+            current_targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in current_targets_raw]
+            
+            if target_id_str in current_targets:
+                await interaction.followup.send("⚠️ Этот обычный мост уже существует!")
+                return
 
-@bot.tree.command(name="bdisconnect")
-async def bdisconnect(interaction: discord.Interaction, source: str, target: str):
-    await interaction.response.defer(ephemeral=True)
-    
+            await redis.rpush(key, target_id_str)
+            await interaction.followup.send(f"✅ Обычный мост создан! `{source_id}` -> `{target_id}`")
+        except Exception as e:
+            await interaction.followup.send(f"❌ Ошибка Redis: {e}")
+
+    elif mode == "cross":
+        if not name:
+            await interaction.followup.send("❌ Для режима cross необходимо указать параметр name (имя моста)!")
+            return
+        
+        safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', name).lower()
+        net_key = f"crossnet:{safe_name}"
+        
+        try:
+            exists = await redis.exists(net_key)
+            if exists:
+                await interaction.followup.send(f"⚠️ Кросс-мост с именем `{safe_name}` уже существует!")
+                return
+                
+            await redis.rpush(net_key, "INIT_MARKER")
+            await interaction.followup.send(f"👑 Кросс-мост чатов `{safe_name}` успешно инициализирован! Используйте `/bconnect` для добавления каналов.")
+        except Exception as e:
+            await interaction.followup.send(f"❌ Ошибка создания кросс-моста: {e}")
+
+# ================= КОМАНДА: /bconnect =================
+@bot.tree.command(name="bconnect", description="Подключить канал к существующему кросс-мосту")
+async def bconnect(interaction: discord.Interaction, bname: str, channel: str):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.followup.send("❌ Нет прав.")
+        await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
         return
+
+    await interaction.response.defer(ephemeral=True)
         
-    try:
-        source_id = extract_id(source)
-        target_id = extract_id(target)
-    except ValueError:
-        await interaction.followup.send("❌ Ошибка в ID.")
-        return
-        
-    key = f"bridge:{source_id}"
-    target_id_str = str(target_id)
+    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', bname).lower()
+    net_key = f"crossnet:{safe_name}"
     
     try:
-        await redis.lrem(key, 0, target_id_str)
-        await redis.lrem(key, 0, target_id_str.encode('utf-8'))
-        await interaction.followup.send("❌ Мост удален.")
+        channel_id = extract_id(channel)
+    except ValueError:
+        await interaction.followup.send("❌ Укажите корректный ID канала.")
+        return
+        
+    try:
+        exists = await redis.exists(net_key)
+        if not exists:
+            await interaction.followup.send(f"❌ Кросс-моста с именем `{safe_name}` не существует! Сначала создайте его через `/bcreate`.")
+            return
+            
+        channel_id_str = str(channel_id)
+        current_channels_raw = await redis.lrange(net_key, 0, -1) or []
+        current_channels = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in current_channels_raw]
+        
+        if channel_id_str in current_channels:
+            await interaction.followup.send(f"⚠️ Этот канал уже подключен к мосту `{safe_name}`!")
+            return
+            
+        await redis.rpush(net_key, channel_id_str)
+        await redis.set(f"channelnet:{channel_id_str}", safe_name)
+        
+        await interaction.followup.send(f"🔗 Канал `{channel_id}` успешно подключен к глобальному кросс-мосту `{safe_name}`!")
     except Exception as e:
-        await interaction.followup.send(f"❌ Ошибка: {e}")
+        await interaction.followup.send(f"❌ Ошибка подключения: {e}")
 
+# ================= ОБРАБОТКА СООБЩЕНИЙ =================
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author == bot.user or (message.webhook_id and message.webhook_id in [wh.id for wh in cached_webhooks.values()]):
+    if message.author == bot.user:
         return
 
-    key = f"bridge:{message.channel.id}"
-    try:
-        target_channels_data = await redis.lrange(key, 0, -1)
-    except:
+    if message.webhook_id and message.webhook_id in [wh.id for wh in cached_webhooks.values()]:
         return
 
-    if not target_channels_data:
-        return
+    current_channel_id_str = str(message.channel.id)
+    targets_to_send = set()
 
-    for target_id_raw in target_channels_data:
-        try:
-            if isinstance(target_id_raw, bytes):
-                target_id = int(target_id_raw.decode('utf-8').strip("'\" "))
-            else:
-                target_id = int(target_id_raw)
-        except:
-            continue
-        
-        target_channel = bot.get_channel(target_id)
-        if not target_channel:
-            try: target_channel = await bot.fetch_channel(target_id)
-            except: continue
-
-        files = [await a.to_file() for a in message.attachments]
-        webhook = await get_target_webhook(target_channel)
-        
-        if webhook:
+    # --- ЛОГИКА 1: Проверяем обычные мосты (Single) ---
+    single_key = f"bridge:{current_channel_id_str}"
+    single_targets_raw = await redis.lrange(single_key, 0, -1)
+    if single_targets_raw:
+        for t_raw in single_targets_raw:
             try:
-                guild_name = f" [{message.guild.name}]" if message.guild else ""
-                await webhook.send(
-                    content=message.content or None,
-                    username=f"{message.author.display_name}{guild_name}",
-                    avatar_url=message.author.display_avatar.url,
-                    embeds=[discord.Embed.from_dict(e.to_dict()) for e in message.embeds],
-                    files=files or discord.utils.MISSING
-                )
-            except Exception as e:
-                print(f"🔴 Ошибка вебхука: {e}")
+                t_str = t_raw.decode('utf-8').strip("'\" ") if isinstance(t_raw, bytes) else str(t_raw).strip("'\" ")
+                targets_to_send.add(int(t_str))
+            except:
+                continue
+
+    # --- ЛОГИКА 2: Проверяем кросс-мосты (Cross) ---
+    cross_net_name_raw = await redis.get(f"channelnet:{current_channel_id_str}")
+    if cross_net_name_raw:
+        cross_net_name = cross_net_name_raw.decode('utf-8') if isinstance(cross_net_name_raw, bytes) else str(cross_net_name_raw)
+        cross_targets_raw = await redis.lrange(f"crossnet:{cross_net_name}", 0, -1) or []
+        
+        for t_raw in cross_targets_raw:
+            try:
+                t_str = t_raw.decode('utf-8').strip("'\" ") if isinstance(t_raw, bytes) else str(t_raw).strip("'\" ")
+                if t_str == "INIT_MARKER":
+                    continue
+                t_id = int(t_str)
+                if t_id != message.channel.id:
+                    targets_to_send.add(t_id)
+            except:
+                continue
+
+    # --- ОТПРАВКА СООБЩЕНИЙ ВО ВСЕ НАЙДЕННЫЕ ТАРГЕТЫ ---
+    if targets_to_send:
+        files = [await a.to_file() for a in message.attachments]
+        
+        for target_id in targets_to_send:
+            target_channel = bot.get_channel(target_id)
+            if not target_channel:
+                try:
+                    target_channel = await bot.fetch_channel(target_id)
+                except:
+                    continue
+
+            webhook = await get_target_webhook(target_channel)
+            if webhook:
+                try:
+                    guild_name = f" [{message.guild.name}]" if message.guild else ""
+                    await webhook.send(
+                        content=message.content or None,
+                        username=f"{message.author.display_name}{guild_name}",
+                        avatar_url=message.author.display_avatar.url if message.author.display_avatar else None,
+                        embeds=[discord.Embed.from_dict(e.to_dict()) for e in message.embeds],
+                        files=files or discord.utils.MISSING
+                    )
+                except Exception as e:
+                    print(f"🔴 Ошибка отправки вебхука в {target_id}: {e}")
 
     await bot.process_commands(message)
 
