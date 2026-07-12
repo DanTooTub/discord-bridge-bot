@@ -22,26 +22,43 @@ from dotenv import load_dotenv
 import asyncio
 import re
 from aiohttp import web
-from upstash_redis.asyncio import Redis
+import sqlitecloud
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(BASE_DIR, "variables.env")
 load_dotenv(dotenv_path=env_path)
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL")
-REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+DB_CONN_STR = os.getenv("SQLITE_CLOUD_CONNECTION_STRING")
 
-if not TOKEN or not REDIS_URL or not REDIS_TOKEN:
+if not TOKEN or not DB_CONN_STR:
     print("❌ Ошибка переменных окружения!")
     exit(1)
 
-redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
+# Инициализируем подключение к SQLite Cloud
+db = sqlitecloud.connect(DB_CONN_STR)
+cursor = db.cursor()
+
+# Создаем таблицы, если их нет (для сохранения структуры "не сломать что есть")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS bridges (
+    bridge_id TEXT PRIMARY KEY,
+    mode TEXT NOT EXISTS CHECK (mode IN ('single', 'cross'))
+);
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS bridge_channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bridge_id TEXT,
+    channel_id TEXT,
+    FOREIGN KEY(bridge_id) REFERENCES bridges(bridge_id) ON DELETE CASCADE
+);
+""")
+db.commit()
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
-
 cached_webhooks = {}
 
 def extract_id(channel_mention: str) -> int:
@@ -67,11 +84,11 @@ async def get_target_webhook(channel):
         return None
 
 async def handle(request):
-    return web.Response(text="Мост работает!")
+    return web.Response(text="Мост на SQLite Cloud работает!")
 
 @bot.event
 async def on_ready():
-    print(f"✅ Бот онлайн: {bot.user.name}")
+    print(f"✅ Бот онлайн (SQLite Cloud): {bot.user.name}")
     try:
         await bot.tree.sync()
         print("🔮 Команды синхронизированы!")
@@ -90,58 +107,31 @@ async def bcreate(interaction: discord.Interaction, mode: str, source: str = Non
         return
 
     await interaction.response.defer(ephemeral=True)
+    bridge_id = str(extract_id(source)) if mode == "single" and source else re.sub(r'[^a-zA-Z0-9_-]', '', name or "").lower()
 
-    if mode == "single":
-        if not source:
-            await interaction.followup.send("❌ Для режима single необходимо указать source (ID канала-источника)!")
+    if mode == "single" and not source:
+        await interaction.followup.send("❌ Для режима single необходимо указать source (ID канала-источника)!")
+        return
+    if mode == "cross" and not name:
+        await interaction.followup.send("❌ Для режима cross необходимо указать параметр name (имя моста)!")
+        return
+
+    try:
+        cursor.execute("SELECT 1 FROM bridges WHERE bridge_id = ?", (bridge_id,))
+        if cursor.fetchone():
+            await interaction.followup.send(f"⚠️ Мост `{bridge_id}` уже существует!")
             return
-        try:
-            source_id = extract_id(source)
-        except ValueError:
-            await interaction.followup.send("❌ Укажите корректный ID канала-источника.")
-            return
 
-        source_id_str = str(source_id)
-        bridge_key = f"bridge:{source_id_str}"
-        meta_key = f"bridgemeta:{source_id_str}"
-
-        try:
-            exists = await redis.exists(meta_key)
-            if exists:
-                await interaction.followup.send(f"⚠️ Мост для источника `{source_id_str}` уже инициализирован!")
-                return
-
-            await redis.set(meta_key, "single")
-            if not await redis.exists(bridge_key):
-                await redis.rpush(bridge_key, "INIT_MARKER")
-
-            await interaction.followup.send(f"📈 Мост трансляции создан! Используйте `/bconnect bname:{source_id_str}` для привязки целевых каналов.")
-        except Exception as e:
-            await interaction.followup.send(f"❌ Ошибка Redis: {e}")
-
-    elif mode == "cross":
-        if not name:
-            await interaction.followup.send("❌ Для режима cross необходимо указать параметр name (имя моста)!")
-            return
+        cursor.execute("INSERT INTO bridges (bridge_id, mode) VALUES (?, ?)", (bridge_id, mode))
+        db.commit()
         
-        safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', name).lower()
-        meta_key = f"bridgemeta:{safe_name}"
-
-        try:
-            exists = await redis.exists(meta_key)
-            if exists:
-                await interaction.followup.send(f"⚠️ Кросс-мост с именем `{safe_name}` уже существует!")
-                return
-
-            await redis.set(meta_key, "cross")
-            net_key = f"crossnet:{safe_name}"
-            await redis.rpush(net_key, "INIT_MARKER")
-            await interaction.followup.send(f"👑 Кросс-мост чатов `{safe_name}` создан! Используйте `/bconnect bname:{safe_name}` для привязки каналов.")
-        except Exception as e:
-            await interaction.followup.send(f"❌ Ошибка Redis: {e}")
+        msg = f"📈 Мост создан! Вызовите `/bconnect bname:{bridge_id}`" if mode == "single" else f"👑 Кросс-мост `{bridge_id}` создан!"
+        await interaction.followup.send(msg)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Ошибка БД: {e}")
 
 # ================= КОМАНДА: /bconnect =================
-@bot.tree.command(name="bconnect", description="Подключить канал к мосту (текущий или указанный через аргумент channel)")
+@bot.tree.command(name="bconnect", description="Подключить канал к мосту")
 async def bconnect(interaction: discord.Interaction, bname: str, channel: str = None):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
@@ -149,60 +139,31 @@ async def bconnect(interaction: discord.Interaction, bname: str, channel: str = 
 
     await interaction.response.defer(ephemeral=True)
     safe_bname = re.sub(r'[^a-zA-Z0-9_-]', '', bname).lower()
-    
-    # Определяем ID целевого канала: либо из аргумента, либо текущий канал
-    if channel:
-        try:
-            target_channel_id_str = str(extract_id(channel))
-        except ValueError:
-            await interaction.followup.send("❌ Укажите корректный ID канала в аргументе channel.")
-            return
-    else:
-        target_channel_id_str = str(interaction.channel_id)
-    
+    target_channel_id_str = str(extract_id(channel)) if channel else str(interaction.channel_id)
+
     try:
-        mode_raw = await redis.get(f"bridgemeta:{safe_bname}")
+        cursor.execute("SELECT mode FROM bridges WHERE bridge_id = ?", (safe_bname,))
+        res = cursor.fetchone()
+        if not res:
+            await interaction.followup.send(f"❌ Моста со значением `{safe_bname}` не существует!")
+            return
         
-        if not mode_raw and await redis.exists(f"bridge:{safe_bname}"):
-            mode = "single"
-            await redis.set(f"bridgemeta:{safe_bname}", "single")
-        elif mode_raw:
-            mode = mode_raw.decode('utf-8') if isinstance(mode_raw, bytes) else str(mode_raw)
-        else:
-            await interaction.followup.send(f"❌ Моста или источника со значением `{safe_bname}` не существует!")
+        mode = res[0]
+
+        cursor.execute("SELECT 1 FROM bridge_channels WHERE bridge_id = ? AND channel_id = ?", (safe_bname, target_channel_id_str))
+        if cursor.fetchone():
+            await interaction.followup.send(f"⚠️ Канал <#{target_channel_id_str}> уже подключен к `{safe_bname}`!")
             return
 
-        if mode == "single":
-            bridge_key = f"bridge:{safe_bname}"
-            
-            current_targets_raw = await redis.lrange(bridge_key, 0, -1) or []
-            current_targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in current_targets_raw]
-            
-            if target_channel_id_str in current_targets:
-                await interaction.followup.send(f"⚠️ Канал <#{target_channel_id_str}> уже принимает трансляцию из источника `{safe_bname}`!")
-                return
-                
-            await redis.rpush(bridge_key, target_channel_id_str)
-            await interaction.followup.send(f"✅ Готово! Канал <#{target_channel_id_str}> теперь получает трансляцию из источника <#{safe_bname}>")
-
-        elif mode == "cross":
-            net_key = f"crossnet:{safe_bname}"
-            current_channels_raw = await redis.lrange(net_key, 0, -1) or []
-            current_channels = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in current_channels_raw]
-            
-            if target_channel_id_str in current_channels:
-                await interaction.followup.send(f"⚠️ Канал <#{target_channel_id_str}> уже подключен к кросс-мосту `{safe_bname}`!")
-                return
-                
-            await redis.rpush(net_key, target_channel_id_str)
-            await redis.sadd(f"crosschannels:{target_channel_id_str}", safe_bname)
-            await interaction.followup.send(f"🔗 Канал <#{target_channel_id_str}> успешно подключен к глобальному кросс-мосту `{safe_bname}`!")
-
+        cursor.execute("INSERT INTO bridge_channels (bridge_id, channel_id) VALUES (?, ?)", (safe_bname, target_channel_id_str))
+        db.commit()
+        
+        await interaction.followup.send(f"✅ Канал <#{target_channel_id_str}> успешно подключен к мосту `{safe_bname}` ({mode})!")
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка подключения: {e}")
 
 # ================= КОМАНДА: /bdelete =================
-@bot.tree.command(name="bdelete", description="Полностью удалить мост (введите имя кросс-моста или ID источника)")
+@bot.tree.command(name="bdelete", description="Полностью удалить мост")
 async def bdelete(interaction: discord.Interaction, name: str):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
@@ -212,89 +173,59 @@ async def bdelete(interaction: discord.Interaction, name: str):
     safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', name).lower()
 
     try:
-        mode_raw = await redis.get(f"bridgemeta:{safe_name}")
-        
-        if not mode_raw and await redis.exists(f"bridge:{safe_name}"):
-            mode = "single"
-        elif mode_raw:
-            mode = mode_raw.decode('utf-8') if isinstance(mode_raw, bytes) else str(mode_raw)
-        else:
-            await interaction.followup.send(f"❌ Моста или источника со значением `{safe_name}` не существует.")
+        cursor.execute("SELECT 1 FROM bridges WHERE bridge_id = ?", (safe_name,))
+        if not cursor.fetchone():
+            await interaction.followup.send(f"❌ Моста `{safe_name}` не существует.")
             return
 
-        if mode == "single":
-            await redis.delete(f"bridge:{safe_name}")
-            
-        elif mode == "cross":
-            net_key = f"crossnet:{safe_name}"
-            channels_raw = await redis.lrange(net_key, 0, -1) or []
-            for c_raw in channels_raw:
-                c_str = c_raw.decode('utf-8') if isinstance(c_raw, bytes) else str(c_raw)
-                if c_str != "INIT_MARKER":
-                    await redis.srem(f"crosschannels:{c_str}", safe_name)
-            await redis.delete(net_key)
-
-        await redis.delete(f"bridgemeta:{safe_name}")
-        await interaction.followup.send(f"🗑️ Мост `{safe_name}` (тип: {mode}) успешно удален из системы!")
-
+        # Каскадное удаление (благодаря FOREIGN KEY ... ON DELETE CASCADE) зачистит и каналы
+        cursor.execute("DELETE FROM bridges WHERE bridge_id = ?", (safe_name,))
+        db.commit()
+        await interaction.followup.send(f"🗑️ Мост `{safe_name}` успешно удален!")
     except Exception as e:
-        await interaction.followup.send(f"❌ Ошибка при удалении моста: {e}")
+        await interaction.followup.send(f"❌ Ошибка удаления: {e}")
 
 # ================= ОБРАБОТКА СООБЩЕНИЙ =================
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author == bot.user:
-        return
-
-    if message.webhook_id and message.webhook_id in [wh.id for wh in cached_webhooks.values()]:
+    if message.author == bot.user or (message.webhook_id and message.webhook_id in [wh.id for wh in cached_webhooks.values()]):
         return
 
     current_channel_id_str = str(message.channel.id)
     targets_to_send = set()
 
-    # --- ЛОГИКА 1: Проверяем классические мосты (Single) ---
-    single_key = f"bridge:{current_channel_id_str}"
-    single_targets_raw = await redis.lrange(single_key, 0, -1)
-    if single_targets_raw:
-        for t_raw in single_targets_raw:
-            try:
-                t_str = t_raw.decode('utf-8').strip("'\" ") if isinstance(t_raw, bytes) else str(t_raw).strip("'\" ")
-                if t_str == "INIT_MARKER":
-                    continue
-                targets_to_send.add(int(t_str))
-            except:
-                continue
+    try:
+        # 1. Проверяем Single-мосты (где текущий канал является именем моста, т.е. источником)
+        cursor.execute("SELECT mode FROM bridges WHERE bridge_id = ?", (current_channel_id_str,))
+        bridge_res = cursor.fetchone()
+        if bridge_res and bridge_res[0] == "single":
+            cursor.execute("SELECT channel_id FROM bridge_channels WHERE bridge_id = ?", (current_channel_id_str,))
+            for row in cursor.fetchall():
+                targets_to_send.add(int(row[0]))
 
-    # --- ЛОГИКА 2: Проверяем кросс-мосты (Cross) ---
-    active_cross_bridges = await redis.smembers(f"crosschannels:{current_channel_id_str}")
-    if active_cross_bridges:
-        for b_bytes in active_cross_bridges:
-            b_name = b_bytes.decode('utf-8') if isinstance(b_bytes, bytes) else str(b_bytes)
-            if await redis.exists(f"bridgemeta:{b_name}"):
-                cross_targets_raw = await redis.lrange(f"crossnet:{b_name}", 0, -1) or []
-                for t_raw in cross_targets_raw:
-                    try:
-                        t_str = t_raw.decode('utf-8').strip("'\" ") if isinstance(t_raw, bytes) else str(t_raw).strip("'\" ")
-                        if t_str == "INIT_MARKER":
-                            continue
-                        t_id = int(t_str)
-                        if t_id != message.channel.id:
-                            targets_to_send.add(t_id)
-                    except:
-                        continue
+        # 2. Проверяем Cross-мосты (ищем cross-мосты, к которым привязан этот канал)
+        cursor.execute("""
+            SELECT bc.bridge_id FROM bridge_channels bc
+            JOIN bridges b ON bc.bridge_id = b.bridge_id
+            WHERE bc.channel_id = ? AND b.mode = 'cross'
+        """, (current_channel_id_str,))
+        
+        cross_bridges = [row[0] for row in cursor.fetchall()]
+        for b_id in cross_bridges:
+            cursor.execute("SELECT channel_id FROM bridge_channels WHERE bridge_id = ?", (b_id,))
+            for row in cursor.fetchall():
+                t_id = int(row[0])
+                if t_id != message.channel.id:
+                    targets_to_send.add(t_id)
+                    
+    except Exception as e:
+        print(f"🔴 Ошибка запроса к SQLite Cloud: {e}")
 
     # --- ОТПРАВКА СООБЩЕНИЙ ВО ВСЕ НАЙДЕННЫЕ ТАРГЕТЫ ---
     if targets_to_send:
         files = [await a.to_file() for a in message.attachments]
-        
         for target_id in targets_to_send:
-            target_channel = bot.get_channel(target_id)
-            if not target_channel:
-                try:
-                    target_channel = await bot.fetch_channel(target_id)
-                except:
-                    continue
-
+            target_channel = bot.get_channel(target_id) or await bot.fetch_channel(target_id)
             webhook = await get_target_webhook(target_channel)
             if webhook:
                 try:
