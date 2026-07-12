@@ -65,7 +65,6 @@
 ```bash
 pip install -r requirements.txt
 ```
-(Убедитесь, что в файле ```requirements.txt``` вместо пакетов redis прописан драйвер sqlitecloud)
 
 ### 3. Запуск бота
 Выполните команду в терминале:
