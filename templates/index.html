@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Discord Bridge Bot</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
+</head>
+<body>
+
+    <div class="blob blob-1"></div>
+    <div class="blob blob-2"></div>
+
+    <nav class="navbar">
+        <div class="container nav-container">
+            <a href="#" class="logo-text">⚡ Bridge<span>BOT</span></a>
+            <div class="nav-links">
+                <a href="#features">Режимы</a>
+                <a href="#docs">Команды</a>
+                <a href="https://discord.com/api/oauth2/authorize?client_id=ТВОЙ_ID&permissions=8&scope=bot%20applications.commands" class="nav-btn" target="_blank">Пригласить</a>
+            </div>
+        </div>
+    </nav>
+
+    <header class="hero">
+        <div class="container">
+            <div class="hero-content">
+                <div class="badge">🔥 Флагманский бот: Почтальон Печкин</div>
+                <h1>Мосты, которые <br>действительно <span>работают</span></h1>
+                <p class="subtitle">Связывай каналы Discord с другими серверами, вики-проектами и внешними ресурсами. Твое надежное асинхронное ядро.</p>
+                <div class="buttons">
+                    <a href="https://discord.com/api/oauth2/authorize?client_id=ТВОЙ_ID&permissions=8&scope=bot%20applications.commands" class="btn btn-primary" target="_blank">Добавить на сервер</a>
+                    <a href="#docs" class="btn btn-secondary">Терминал команд</a>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <section class="stats">
+        <div class="container grid-3">
+            <div class="stat-card">
+                <div class="stat-icon">💻</div>
+                <h3 id="stat-guilds">{{ guilds_count }}</h3>
+                <p>Серверов в сети</p>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">🌿</div>
+                <h3 id="stat-bridges">{{ total_bridges }}</h3>
+                <p>Активных мостов</p>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">⚡</div>
+                <h3 id="stat-ping">{{ bot_latency }} ms</h3>
+                <p>Задержка ядра</p>
+            </div>
+        </div>
+    </section>
+
+    <section id="features" class="features">
+        <div class="container">
+            <h2 class="section-title">Гибкая маршрутизация сообщений</h2>
+            <div class="grid-2">
+                <div class="feature-card">
+                    <div class="feature-header">
+                        <span class="feat-badge">Режим 1</span>
+                        <div class="feat-icon">📢</div>
+                    </div>
+                    <h3>Single-Мосты</h3>
+                    <p>Однонаправленная доставка. Идеально подходит для автоматического импорта логов правок с ваших вики-проектов (Fandom/Miraheze) прямо на сервер.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-header">
+                        <span class="feat-badge">Режим 2</span>
+                        <div class="feat-icon">👑</div>
+                    </div>
+                    <h3>Cross-Сети</h3>
+                    <p>Многосторонний сквозной чат. Превращает разрозненные каналы разных серверов в единую синхронизированную экосистему общения.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="docs" class="docs">
+        <div class="container">
+            <h2 class="section-title">Интерактивный терминал</h2>
+            <p class="section-subtitle">Кликни по кнопкам слева, чтобы запустить симуляцию выполнения команды в терминале.</p>
+            
+            <div class="terminal-container">
+                <div class="terminal-buttons">
+                    <button class="t-btn active" data-cmd="help">--help</button>
+                    <button class="t-btn" data-cmd="create">/bcreate</button>
+                    <button class="t-btn" data-cmd="connect">/bconnect</button>
+                    <button class="t-btn" data-cmd="list">/blist</button>
+                </div>
+
+                <div class="terminal">
+                    <div class="terminal-header">
+                        <span class="dot red"></span>
+                        <span class="dot yellow"></span>
+                        <span class="dot green"></span>
+                        <span class="title">pechkin_terminal.sh</span>
+                    </div>
+                    <div class="terminal-body" id="terminal-screen">
+                        </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2026 Pentagram Software. <br><span>Создано: DanTooTub</span></p>
+        </div>
+    </footer>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>
