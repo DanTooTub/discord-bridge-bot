@@ -1,4 +1,6 @@
 discord.py
 python-dotenv
-aiohttp
 upstash-redis
+fastapi
+uvicorn
+jinja2
