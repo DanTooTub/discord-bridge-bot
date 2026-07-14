@@ -201,8 +201,8 @@ async def bconnect(interaction: discord.Interaction, bname: str, channel: str = 
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка подключения: {e}")
 
-# ================= КОМАНДА: /blist (Redis) =================
-@bot.tree.command(name="blist", description="Показать список мостов, подключенных к каналам этого сервера")
+# ================= КОМАНДА: /blist =================
+@bot.tree.command(name="blist", description="Показать список мостов, связанных с каналами этого сервера")
 async def blist(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("❌ Эту команду можно использовать только на сервере!", ephemeral=True)
@@ -222,25 +222,48 @@ async def blist(interaction: discord.Interaction):
         meta_keys = [k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in meta_keys_raw]
 
         embed = discord.Embed(
-            title=f"🌐 Активные мосты сервера {interaction.guild.name}", 
+            title=f"🌐 Активные связи мостов для сервера {interaction.guild.name}", 
             color=0x2ecc71
         )
         
         shown_count = 0
 
-        # Функция для красивого форматирования списка каналов
-        def format_channels(channel_ids_list):
-            formatted = []
-            for cid in channel_ids_list:
-                if cid == "INIT_MARKER":
-                    continue
-                if cid in local_channel_ids:
-                    formatted.append(f"<#{cid}>")
-                else:
-                    formatted.append("`*Другой сервер*`")
-            return ", ".join(formatted) if formatted else "*Нет подключенных каналов*"
+        # Вспомогательная функция для красивого распознавания чужих и своих каналов
+        async def resolve_channel_name(cid: str) -> str:
+            if cid == "INIT_MARKER":
+                return ""
+            
+            # Если канал наш — просто упоминаем его
+            if cid in local_channel_ids:
+                status_suffix = " 🔇 *(Muted)*" if await redis.exists(f"bridge_mute:{cid}") else ""
+                return f"<#{cid}>{status_suffix}"
+            
+            # Если канал чужой — пытаемся найти сервер и имя канала
+            try:
+                target_id = int(cid)
+                channel = bot.get_channel(target_id)
+                if not channel:
+                    channel = await bot.fetch_channel(target_id)
+                
+                if channel and isinstance(channel, discord.abc.GuildChannel):
+                    guild_part = f"**{channel.guild.name}**"
+                    channel_part = f"#{channel.name}"
+                    return f"🌐 {guild_part} > {channel_part}"
+            except Exception:
+                pass
+            
+            # Резервный вариант, если бот не имеет доступа к тому серверу
+            return f"❓ Неизвестный сервер (ID: {cid})"
 
-        # 1. Если мета-ключей вообще нет, проверяем совместимость со старыми bridge:*
+        async def format_channels(channel_ids_list):
+            resolved = []
+            for cid in channel_ids_list:
+                name = await resolve_channel_name(cid)
+                if name:
+                    resolved.append(name)
+            return "\n".join(resolved) if resolved else "*Нет подключенных каналов*"
+
+        # 1. Если мета-ключей вообще нет (совместимость со старой структурой bridge:*)
         if not meta_keys:
             bridge_keys_raw = await redis.keys("bridge:*") or []
             bridge_keys = [k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in bridge_keys_raw]
@@ -250,16 +273,16 @@ async def blist(interaction: discord.Interaction):
                 targets_raw = await redis.lrange(bk, 0, -1) or []
                 targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in targets_raw]
                 
-                # Мост наш, если источник или любой из таргетов находится на этом сервере
+                # Показываем мост, только если источник или один из получателей связан с текущим сервером
                 is_local = (source_id in local_channel_ids) or any(t in local_channel_ids for t in targets)
                 
                 if is_local:
                     shown_count += 1
-                    source_mention = f"<#{source_id}>" if source_id in local_channel_ids else "`*Другой сервер*`"
-                    targets_mention = format_channels(targets)
+                    source_info = await resolve_channel_name(source_id)
+                    targets_info = await format_channels(targets)
                     embed.add_field(
-                        name=f"📢 Источник: {source_mention} (ID: {source_id})",
-                        value=f"➡️ Получатели: {targets_mention}",
+                        name=f"📢 Источник: {source_info}",
+                        value=f"➡️ Получатели:\n{targets_info}",
                         inline=False
                     )
             
@@ -269,7 +292,7 @@ async def blist(interaction: discord.Interaction):
                 await interaction.followup.send(embed=embed)
             return
 
-        # 2. Логика для новой архитектуры с bridgemeta:*
+        # 2. Новая архитектура с bridgemeta:*
         for mk in meta_keys:
             name_or_id = mk.split(":")[-1]
             mode_raw = await redis.get(mk)
@@ -283,11 +306,11 @@ async def blist(interaction: discord.Interaction):
                 
                 if is_local:
                     shown_count += 1
-                    source_mention = f"<#{name_or_id}>" if name_or_id in local_channel_ids else "`*Другой сервер*`"
-                    targets_mention = format_channels(targets)
+                    source_info = await resolve_channel_name(name_or_id)
+                    targets_info = await format_channels(targets)
                     embed.add_field(
-                        name=f"📢 Single: {source_mention} (ID: {name_or_id})",
-                        value=f"➡️ Трансляция в: {targets_mention}",
+                        name=f"📢 Single-Мост (Источник: {source_info})",
+                        value=f"➡️ Трансляция в:\n{targets_info}",
                         inline=False
                     )
 
@@ -299,10 +322,10 @@ async def blist(interaction: discord.Interaction):
                 
                 if is_local:
                     shown_count += 1
-                    channels_mention = format_channels(channels)
+                    channels_info = await format_channels(channels)
                     embed.add_field(
                         name=f"👑 Cross-сеть: `{name_or_id}`",
-                        value=f"🔗 Участники: {channels_mention}",
+                        value=f"🔗 Связанные каналы:\n{channels_info}",
                         inline=False
                     )
 
