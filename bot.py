@@ -15,6 +15,7 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 
 import os
+import io
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -150,7 +151,6 @@ async def bconnect(interaction: discord.Interaction, bname: str, channel: str = 
     await interaction.response.defer(ephemeral=True)
     safe_bname = re.sub(r'[^a-zA-Z0-9_-]', '', bname).lower()
     
-    # Определяем ID целевого канала: либо из аргумента, либо текущий канал
     if channel:
         try:
             target_channel_id_str = str(extract_id(channel))
@@ -200,6 +200,76 @@ async def bconnect(interaction: discord.Interaction, bname: str, channel: str = 
 
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка подключения: {e}")
+
+# ================= КОМАНДА: /blist =================
+@bot.tree.command(name="blist", description="Показать список всех активных мостов и подключенных каналов")
+async def blist(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        meta_keys_raw = await redis.keys("bridgemeta:*") or []
+        meta_keys = [k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in meta_keys_raw]
+
+        if not meta_keys:
+            # Резервный поиск для обратной совместимости по старым ключам bridge:*
+            bridge_keys_raw = await redis.keys("bridge:*") or []
+            bridge_keys = [k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in bridge_keys_raw]
+            if not bridge_keys:
+                await interaction.followup.send("📭 Активных мостов не найдено.")
+                return
+            
+            embed = discord.Embed(title="🌐 Список активных мостов (Совместимость)", color=0x3498db)
+            for bk in bridge_keys:
+                source_id = bk.split(":")[-1]
+                targets_raw = await redis.lrange(bk, 0, -1) or []
+                targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in targets_raw if (t.decode('utf-8') if isinstance(t, bytes) else str(t)) != "INIT_MARKER"]
+                targets_mention = ", ".join([f"<#{t}>" for t in targets]) if targets else "*Нет подключенных каналов*"
+                embed.add_field(name=f"📢 Источник: <#{source_id}> (ID: {source_id})", value=f"➡️ Получатели: {targets_mention}", inline=False)
+            await interaction.followup.send(embed=embed)
+            return
+
+        embed = discord.Embed(title="🌐 Список активных мостов", color=0x2ecc71)
+        single_count = 0
+        cross_count = 0
+
+        for mk in meta_keys:
+            name_or_id = mk.split(":")[-1]
+            mode_raw = await redis.get(mk)
+            mode = mode_raw.decode('utf-8') if isinstance(mode_raw, bytes) else str(mode_raw)
+
+            if mode == "single":
+                single_count += 1
+                targets_raw = await redis.lrange(f"bridge:{name_or_id}", 0, -1) or []
+                targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in targets_raw if (t.decode('utf-8') if isinstance(t, bytes) else str(t)) != "INIT_MARKER"]
+                targets_mention = ", ".join([f"<#{t}>" for t in targets]) if targets else "*Нет подключенных каналов*"
+                embed.add_field(
+                    name=f"📢 Single: <#{name_or_id}> (ID: {name_or_id})",
+                    value=f"➡️ Трансляция в: {targets_mention}",
+                    inline=False
+                )
+
+            elif mode == "cross":
+                cross_count += 1
+                channels_raw = await redis.lrange(f"crossnet:{name_or_id}", 0, -1) or []
+                channels = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in channels_raw if (c.decode('utf-8') if isinstance(c, bytes) else str(c)) != "INIT_MARKER"]
+                channels_mention = ", ".join([f"<#{c}>" for c in channels]) if channels else "*Нет подключенных каналов*"
+                embed.add_field(
+                    name=f"👑 Cross-сеть: `{name_or_id}`",
+                    value=f"🔗 Участники: {channels_mention}",
+                    inline=False
+                )
+
+        if single_count == 0 and cross_count == 0:
+            await interaction.followup.send("📭 Активных мостов не найдено.")
+        else:
+            await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Ошибка при получении списка: {e}")
 
 # ================= КОМАНДА: /bdelete =================
 @bot.tree.command(name="bdelete", description="Полностью удалить мост (введите имя кросс-моста или ID источника)")
@@ -285,7 +355,16 @@ async def on_message(message: discord.Message):
 
     # --- ОТПРАВКА СООБЩЕНИЙ ВО ВСЕ НАЙДЕННЫЕ ТАРГЕТЫ ---
     if targets_to_send:
-        files = [await a.to_file() for a in message.attachments]
+        # Скачиваем файлы и оборачиваем их заново с сохранением оригинальных свойств
+        files = []
+        for attachment in message.attachments:
+            try:
+                fp = io.BytesIO()
+                await attachment.save(fp)
+                discord_file = discord.File(fp, filename=attachment.filename, spoiler=attachment.is_spoiler())
+                files.append(discord_file)
+            except Exception as e:
+                print(f"🔴 Ошибка подготовки файла {attachment.filename}: {e}")
         
         for target_id in targets_to_send:
             target_channel = bot.get_channel(target_id)
@@ -299,6 +378,10 @@ async def on_message(message: discord.Message):
             if webhook:
                 try:
                     guild_name = f" [{message.guild.name}]" if message.guild else ""
+                    # Сбрасываем указатель буфера в начало перед каждой отправкой
+                    for f in files:
+                        f.fp.seek(0)
+
                     await webhook.send(
                         content=message.content or None,
                         username=f"{message.author.display_name}{guild_name}",
