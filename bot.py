@@ -201,9 +201,13 @@ async def bconnect(interaction: discord.Interaction, bname: str, channel: str = 
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка подключения: {e}")
 
-# ================= КОМАНДА: /blist =================
-@bot.tree.command(name="blist", description="Показать список всех активных мостов и подключенных каналов")
+# ================= КОМАНДА: /blist (Redis) =================
+@bot.tree.command(name="blist", description="Показать список мостов, подключенных к каналам этого сервера")
 async def blist(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Эту команду можно использовать только на сервере!", ephemeral=True)
+        return
+
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
         return
@@ -211,60 +215,99 @@ async def blist(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
     try:
+        # Собираем ID всех текстовых каналов текущего сервера
+        local_channel_ids = {str(ch.id) for ch in interaction.guild.text_channels}
+
         meta_keys_raw = await redis.keys("bridgemeta:*") or []
         meta_keys = [k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in meta_keys_raw]
 
+        embed = discord.Embed(
+            title=f"🌐 Активные мосты сервера {interaction.guild.name}", 
+            color=0x2ecc71
+        )
+        
+        shown_count = 0
+
+        # Функция для красивого форматирования списка каналов
+        def format_channels(channel_ids_list):
+            formatted = []
+            for cid in channel_ids_list:
+                if cid == "INIT_MARKER":
+                    continue
+                if cid in local_channel_ids:
+                    formatted.append(f"<#{cid}>")
+                else:
+                    formatted.append("`*Другой сервер*`")
+            return ", ".join(formatted) if formatted else "*Нет подключенных каналов*"
+
+        # 1. Если мета-ключей вообще нет, проверяем совместимость со старыми bridge:*
         if not meta_keys:
-            # Резервный поиск для обратной совместимости по старым ключам bridge:*
             bridge_keys_raw = await redis.keys("bridge:*") or []
             bridge_keys = [k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in bridge_keys_raw]
-            if not bridge_keys:
-                await interaction.followup.send("📭 Активных мостов не найдено.")
-                return
             
-            embed = discord.Embed(title="🌐 Список активных мостов (Совместимость)", color=0x3498db)
             for bk in bridge_keys:
                 source_id = bk.split(":")[-1]
                 targets_raw = await redis.lrange(bk, 0, -1) or []
-                targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in targets_raw if (t.decode('utf-8') if isinstance(t, bytes) else str(t)) != "INIT_MARKER"]
-                targets_mention = ", ".join([f"<#{t}>" for t in targets]) if targets else "*Нет подключенных каналов*"
-                embed.add_field(name=f"📢 Источник: <#{source_id}> (ID: {source_id})", value=f"➡️ Получатели: {targets_mention}", inline=False)
-            await interaction.followup.send(embed=embed)
+                targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in targets_raw]
+                
+                # Мост наш, если источник или любой из таргетов находится на этом сервере
+                is_local = (source_id in local_channel_ids) or any(t in local_channel_ids for t in targets)
+                
+                if is_local:
+                    shown_count += 1
+                    source_mention = f"<#{source_id}>" if source_id in local_channel_ids else "`*Другой сервер*`"
+                    targets_mention = format_channels(targets)
+                    embed.add_field(
+                        name=f"📢 Источник: {source_mention} (ID: {source_id})",
+                        value=f"➡️ Получатели: {targets_mention}",
+                        inline=False
+                    )
+            
+            if shown_count == 0:
+                await interaction.followup.send("📭 На этом сервере не найдено активных мостов.")
+            else:
+                await interaction.followup.send(embed=embed)
             return
 
-        embed = discord.Embed(title="🌐 Список активных мостов", color=0x2ecc71)
-        single_count = 0
-        cross_count = 0
-
+        # 2. Логика для новой архитектуры с bridgemeta:*
         for mk in meta_keys:
             name_or_id = mk.split(":")[-1]
             mode_raw = await redis.get(mk)
             mode = mode_raw.decode('utf-8') if isinstance(mode_raw, bytes) else str(mode_raw)
 
             if mode == "single":
-                single_count += 1
                 targets_raw = await redis.lrange(f"bridge:{name_or_id}", 0, -1) or []
-                targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in targets_raw if (t.decode('utf-8') if isinstance(t, bytes) else str(t)) != "INIT_MARKER"]
-                targets_mention = ", ".join([f"<#{t}>" for t in targets]) if targets else "*Нет подключенных каналов*"
-                embed.add_field(
-                    name=f"📢 Single: <#{name_or_id}> (ID: {name_or_id})",
-                    value=f"➡️ Трансляция в: {targets_mention}",
-                    inline=False
-                )
+                targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in targets_raw]
+                
+                is_local = (name_or_id in local_channel_ids) or any(t in local_channel_ids for t in targets)
+                
+                if is_local:
+                    shown_count += 1
+                    source_mention = f"<#{name_or_id}>" if name_or_id in local_channel_ids else "`*Другой сервер*`"
+                    targets_mention = format_channels(targets)
+                    embed.add_field(
+                        name=f"📢 Single: {source_mention} (ID: {name_or_id})",
+                        value=f"➡️ Трансляция в: {targets_mention}",
+                        inline=False
+                    )
 
             elif mode == "cross":
-                cross_count += 1
                 channels_raw = await redis.lrange(f"crossnet:{name_or_id}", 0, -1) or []
-                channels = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in channels_raw if (c.decode('utf-8') if isinstance(c, bytes) else str(c)) != "INIT_MARKER"]
-                channels_mention = ", ".join([f"<#{c}>" for c in channels]) if channels else "*Нет подключенных каналов*"
-                embed.add_field(
-                    name=f"👑 Cross-сеть: `{name_or_id}`",
-                    value=f"🔗 Участники: {channels_mention}",
-                    inline=False
-                )
+                channels = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in channels_raw]
+                
+                is_local = any(c in local_channel_ids for c in channels)
+                
+                if is_local:
+                    shown_count += 1
+                    channels_mention = format_channels(channels)
+                    embed.add_field(
+                        name=f"👑 Cross-сеть: `{name_or_id}`",
+                        value=f"🔗 Участники: {channels_mention}",
+                        inline=False
+                    )
 
-        if single_count == 0 and cross_count == 0:
-            await interaction.followup.send("📭 Активных мостов не найдено.")
+        if shown_count == 0:
+            await interaction.followup.send("📭 На этом сервере не найдено активных мостов.")
         else:
             await interaction.followup.send(embed=embed)
 
