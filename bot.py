@@ -69,12 +69,16 @@ async def home(request: Request):
 
     guilds_count = len(bot.guilds) if bot.is_ready() else 0
 
-    return templates.TemplateResponse("index.html", {
-        "request": request,
-        "guilds_count": guilds_count,
-        "total_bridges": total_bridges,
-        "bot_latency": round(bot.latency * 1000) if bot.is_ready() else 0
-    })
+    # ФИКС: Передаем объект request первым аргументом, а контекст — третьим
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {
+            "guilds_count": guilds_count,
+            "total_bridges": total_bridges,
+            "bot_latency": round(bot.latency * 1000) if bot.is_ready() else 0
+        }
+    )
 
 @app.get("/ping")
 async def ping():
@@ -391,7 +395,7 @@ async def blist(interaction: discord.Interaction):
                     targets_info = await format_channels(targets)
                     embed.add_field(
                         name=f"📢 Single-Мост (Источник: {source_info})",
-                        value=f"➡️ Трансляция в:\n{targets_info}",
+                        value=f"➡️ Трасляция в:\n{targets_info}",
                         inline=False
                     )
 
@@ -423,5 +427,4 @@ async def blist(interaction: discord.Interaction):
 # ================= АВТОЗАПУСК СЕРВЕРА С БОТОМ =================
 if __name__ == "__main__":
     import uvicorn
-    # Просто пишем в консоли `python bot.py` — и всё заработает!
     uvicorn.run("bot:app", host="0.0.0.0", port=10000, reload=False)
