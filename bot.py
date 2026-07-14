@@ -38,15 +38,24 @@ async def lifespan(app: FastAPI):
     await bot.close()
     await redis.close()
 
+# ================= НАСТРОЙКА АБСОЛЮТНЫХ ПУТЕЙ (ФИКС ДЛЯ RENDER) =================
+# Получаем абсолютный путь к папке, в которой лежит этот файл bot.py
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Инициализируем FastAPI с привязкой к жизненному циклу бота
 app = FastAPI(lifespan=lifespan)
 
-# Создаем структуры папок, если их нет
-os.makedirs("static", exist_ok=True)
-os.makedirs("templates", exist_ok=True)
+# Создаем структуры папок по строго абсолютным путям
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+os.makedirs(STATIC_DIR, exist_ok=True)
+os.makedirs(TEMPLATES_DIR, exist_ok=True)
+
+# Монтируем статику и шаблоны, используя абсолютные пути
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+templates = Jinja2Templates(directory=TEMPLATES_DIR)
+
 
 # ================= ВЕБ-САЙТ: МАРШРУТЫ (ROUTES) =================
 @app.get("/", response_class=HTMLResponse)
@@ -105,7 +114,6 @@ async def on_message(message: discord.Message):
     channel_id_str = str(message.channel.id)
 
     # 2. Обработка Cross-сетей
-    # Пытаемся найти, к каким crossnet-сетям относится текущий канал
     cross_keys_raw = await redis.keys("crossnet:*") or []
     cross_keys = [k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in cross_keys_raw]
 
@@ -137,7 +145,6 @@ async def on_message(message: discord.Message):
                         print(f"Ошибка пересылки crossnet в {target_id}: {e}")
 
     # 3. Обработка Single-мостов
-    # Проверяем, является ли текущий канал источником в каком-либо мосту
     bridge_key = f"bridge:{channel_id_str}"
     if await redis.exists(bridge_key):
         targets_raw = await redis.lrange(bridge_key, 0, -1) or []
@@ -181,20 +188,16 @@ async def bcreate(interaction: discord.Interaction, name: str, mode: str):
     await interaction.response.defer(ephemeral=True)
 
     try:
-        # Для Single мостов в качестве уникального ID используем ID канала-создателя (источника)
         if mode == "single":
             bridge_id = str(interaction.channel.id)
             meta_key = f"bridgemeta:{bridge_id}"
             bridge_key = f"bridge:{bridge_id}"
             
             await redis.set(meta_key, "single")
-            # Добавляем маркер инициализации, чтобы ключ существовал в бд
             await redis.rpush(bridge_key, "INIT_MARKER")
             await interaction.followup.send(f"✅ Single-мост успешно создан!\n🔑 **ID моста:** `{bridge_id}`\nИспользуйте его на другом сервере для привязки: `/bconnect name:{bridge_id}`")
         
-        # Для Cross-сетей используем кастомное имя
         elif mode == "cross":
-            # Валидируем имя (без пробелов)
             clean_name = re.sub(r'[^a-zA-Z0-9_-]', '', name).lower()
             if not clean_name:
                 await interaction.followup.send("❌ Недопустимое имя сети!")
@@ -237,7 +240,6 @@ async def bconnect(interaction: discord.Interaction, name: str):
 
         if mode == "single":
             bridge_key = f"bridge:{name}"
-            # Проверяем, не привязан ли уже этот канал
             targets_raw = await redis.lrange(bridge_key, 0, -1) or []
             targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in targets_raw]
 
@@ -285,13 +287,11 @@ async def bdelete(interaction: discord.Interaction, name: str):
         channel_id_str = str(interaction.channel.id)
 
         if mode == "single":
-            # Если удаляет создатель (источник) моста — сносим весь мост
             if name == channel_id_str:
                 await redis.delete(f"bridge:{name}")
                 await redis.delete(meta_key)
                 await interaction.followup.send(f"🗑️ Single-мост `{name}` полностью удален из базы данных.")
             else:
-                # Если удаляет получатель — просто отвязываем его канал
                 bridge_key = f"bridge:{name}"
                 await redis.lrem(bridge_key, 0, channel_id_str)
                 await interaction.followup.send(f"🔌 Канал успешно отвязан от моста `{name}`.")
@@ -300,7 +300,6 @@ async def bdelete(interaction: discord.Interaction, name: str):
             cross_key = f"crossnet:{name}"
             await redis.lrem(cross_key, 0, channel_id_str)
             
-            # Проверяем, остались ли еще участники в кросс-сети
             remaining = await redis.llen(cross_key)
             if remaining == 0:
                 await redis.delete(cross_key)
