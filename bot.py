@@ -171,9 +171,13 @@ async def bconnect(interaction: discord.Interaction, bname: str, channel: str = 
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка подключения: {e}")
 
-# ================= КОМАНДА: /blist =================
-@bot.tree.command(name="blist", description="Показать список всех активных мостов и подключенных каналов")
+# ================= КОМАНДА: /blist (SQLite Cloud) =================
+@bot.tree.command(name="blist", description="Показать список мостов, подключенных к каналам этого сервера")
 async def blist(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Эту команду можно использовать только на сервере!", ephemeral=True)
+        return
+
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
         return
@@ -181,28 +185,61 @@ async def blist(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
     try:
-        cursor.execute("SELECT bridge_id, mode FROM bridges")
+        # Собираем ID всех текстовых каналов текущего сервера
+        local_channels = [str(ch.id) for ch in interaction.guild.text_channels]
+        
+        if not local_channels:
+            await interaction.followup.send("📭 На этом сервере нет текстовых каналов.")
+            return
+
+        # Плейсхолдеры для SQL-запроса (?, ?, ?)
+        placeholders = ",".join(["?"] * len(local_channels))
+
+        # Выбираем только те мосты, которые:
+        # а) Имеют записи каналов с текущего сервера в bridge_channels
+        # б) Либо сами являются single-мостом, запущенным на локальном канале (bridge_id равен ID локального канала)
+        query = f"""
+            SELECT DISTINCT b.bridge_id, b.mode FROM bridges b
+            LEFT JOIN bridge_channels bc ON b.bridge_id = bc.bridge_id
+            WHERE bc.channel_id IN ({placeholders}) OR b.bridge_id IN ({placeholders})
+        """
+        
+        # Передаем список каналов дважды (для bc.channel_id и для b.bridge_id)
+        cursor.execute(query, local_channels + local_channels)
         bridges = cursor.fetchall()
 
         if not bridges:
-            await interaction.followup.send("📭 Активных мостов не найдено.")
+            await interaction.followup.send("📭 На этом сервере не найдено активных мостов.")
             return
 
-        embed = discord.Embed(title="🌐 Список активных мостов (SQL)", color=0x9b59b6)
+        embed = discord.Embed(
+            title=f"🌐 Активные мосты сервера {interaction.guild.name} (SQL)", 
+            color=0x9b59b6
+        )
 
         for bridge_row in bridges:
             bridge_id = bridge_row[0]
             mode = bridge_row[1]
 
+            # Тянем ВСЕ каналы для этого моста, чтобы показать их связи
             cursor.execute("SELECT channel_id FROM bridge_channels WHERE bridge_id = ?", (bridge_id,))
             channels_rows = cursor.fetchall()
             channels = [row[0] for row in channels_rows]
             
-            channels_mention = ", ".join([f"<#{c}>" for c in channels]) if channels else "*Нет подключенных каналов*"
+            # Форматируем список каналов (свои упоминаем, чужие маскируем)
+            formatted = []
+            for c in channels:
+                if c in local_channels:
+                    formatted.append(f"<#{c}>")
+                else:
+                    formatted.append("`*Другой сервер*`")
+            
+            channels_mention = ", ".join(formatted) if formatted else "*Нет подключенных каналов*"
 
             if mode == "single":
+                source_mention = f"<#{bridge_id}>" if bridge_id in local_channels else "`*Другой сервер*`"
                 embed.add_field(
-                    name=f"📢 Single: <#{bridge_id}> (ID: {bridge_id})",
+                    name=f"📢 Single: {source_mention} (ID: {bridge_id})",
                     value=f"➡️ Трансляция в: {channels_mention}",
                     inline=False
                 )
