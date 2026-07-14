@@ -171,8 +171,8 @@ async def bconnect(interaction: discord.Interaction, bname: str, channel: str = 
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка подключения: {e}")
 
-# ================= КОМАНДА: /blist (SQLite Cloud) =================
-@bot.tree.command(name="blist", description="Показать список мостов, подключенных к каналам этого сервера")
+# ================= КОМАНДА: /blist =================
+@bot.tree.command(name="blist", description="Показать список мостов, связанных с каналами этого сервера")
 async def blist(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("❌ Эту команду можно использовать только на сервере!", ephemeral=True)
@@ -192,19 +192,15 @@ async def blist(interaction: discord.Interaction):
             await interaction.followup.send("📭 На этом сервере нет текстовых каналов.")
             return
 
-        # Плейсхолдеры для SQL-запроса (?, ?, ?)
         placeholders = ",".join(["?"] * len(local_channels))
 
-        # Выбираем только те мосты, которые:
-        # а) Имеют записи каналов с текущего сервера в bridge_channels
-        # б) Либо сами являются single-мостом, запущенным на локальном канале (bridge_id равен ID локального канала)
+        # Выбираем только те мосты, которые физически связаны с текущим сервером
         query = f"""
             SELECT DISTINCT b.bridge_id, b.mode FROM bridges b
             LEFT JOIN bridge_channels bc ON b.bridge_id = bc.bridge_id
             WHERE bc.channel_id IN ({placeholders}) OR b.bridge_id IN ({placeholders})
         """
         
-        # Передаем список каналов дважды (для bc.channel_id и для b.bridge_id)
         cursor.execute(query, local_channels + local_channels)
         bridges = cursor.fetchall()
 
@@ -213,40 +209,67 @@ async def blist(interaction: discord.Interaction):
             return
 
         embed = discord.Embed(
-            title=f"🌐 Активные мосты сервера {interaction.guild.name} (SQL)", 
+            title=f"🌐 Активные связи мостов для сервера {interaction.guild.name} (SQL)", 
             color=0x9b59b6
         )
+
+        # Вспомогательная функция для красивого распознавания чужих и своих каналов
+        async def resolve_channel_name(cid: str, is_muted: int = 0) -> str:
+            # Если канал наш — просто упоминаем его
+            if cid in local_channels:
+                status_suffix = " 🔇 *(Muted)*" if is_muted == 1 else ""
+                return f"<#{cid}>{status_suffix}"
+            
+            # Если канал чужой — пытаемся найти сервер и имя канала через Discord API/кэш
+            try:
+                target_id = int(cid)
+                channel = bot.get_channel(target_id)
+                if not channel:
+                    channel = await bot.fetch_channel(target_id)
+                
+                if channel and isinstance(channel, discord.abc.GuildChannel):
+                    guild_part = f"**{channel.guild.name}**"
+                    channel_part = f"#{channel.name}"
+                    status_suffix = " 🔇 *(Muted)*" if is_muted == 1 else ""
+                    return f"🌐 {guild_part} > {channel_part}{status_suffix}"
+            except Exception:
+                pass
+            
+            # Резервный вариант
+            return f"❓ Неизвестный сервер (ID: {cid})"
 
         for bridge_row in bridges:
             bridge_id = bridge_row[0]
             mode = bridge_row[1]
 
-            # Тянем ВСЕ каналы для этого моста, чтобы показать их связи
-            cursor.execute("SELECT channel_id FROM bridge_channels WHERE bridge_id = ?", (bridge_id,))
+            # Тянем из БД информацию обо всех каналах-участниках этого конкретного моста
+            cursor.execute("SELECT channel_id, is_muted FROM bridge_channels WHERE bridge_id = ?", (bridge_id,))
             channels_rows = cursor.fetchall()
-            channels = [row[0] for row in channels_rows]
             
-            # Форматируем список каналов (свои упоминаем, чужие маскируем)
-            formatted = []
-            for c in channels:
-                if c in local_channels:
-                    formatted.append(f"<#{c}>")
-                else:
-                    formatted.append("`*Другой сервер*`")
+            formatted_channels = []
+            for row in channels_rows:
+                cid, is_muted = row[0], row[1]
+                resolved_name = await resolve_channel_name(cid, is_muted)
+                formatted_channels.append(resolved_name)
             
-            channels_mention = ", ".join(formatted) if formatted else "*Нет подключенных каналов*"
+            channels_mention = "\n".join(formatted_channels) if formatted_channels else "*Нет подключенных каналов*"
 
             if mode == "single":
-                source_mention = f"<#{bridge_id}>" if bridge_id in local_channels else "`*Другой сервер*`"
+                # Определяем, заглушен ли сам источник моста (если он на нашем сервере)
+                cursor.execute("SELECT is_muted FROM bridge_channels WHERE bridge_id = ? AND channel_id = ?", (bridge_id, bridge_id))
+                source_mute_res = cursor.fetchone()
+                source_is_muted = source_mute_res[0] if source_mute_res else 0
+                
+                source_info = await resolve_channel_name(bridge_id, source_is_muted)
                 embed.add_field(
-                    name=f"📢 Single: {source_mention} (ID: {bridge_id})",
-                    value=f"➡️ Трансляция в: {channels_mention}",
+                    name=f"📢 Single-Мост (Источник: {source_info})",
+                    value=f"➡️ Трансляция в:\n{channels_mention}",
                     inline=False
                 )
             elif mode == "cross":
                 embed.add_field(
                     name=f"👑 Cross-сеть: `{bridge_id}`",
-                    value=f"🔗 Участники: {channels_mention}",
+                    value=f"🔗 Связанные каналы:\n{channels_mention}",
                     inline=False
                 )
 
