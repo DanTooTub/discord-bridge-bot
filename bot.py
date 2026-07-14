@@ -218,8 +218,15 @@ async def blist(interaction: discord.Interaction):
         # Собираем ID всех текстовых каналов текущего сервера
         local_channel_ids = {str(ch.id) for ch in interaction.guild.text_channels}
 
+        # Получаем абсолютно все существующие ключи мостов и метаданных
+        bridge_keys_raw = await redis.keys("bridge:*") or []
+        bridge_keys = {k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in bridge_keys_raw}
+
         meta_keys_raw = await redis.keys("bridgemeta:*") or []
-        meta_keys = [k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in meta_keys_raw]
+        meta_keys = {k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in meta_keys_raw}
+
+        cross_keys_raw = await redis.keys("crossnet:*") or []
+        cross_keys = {k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in cross_keys_raw}
 
         embed = discord.Embed(
             title=f"🌐 Активные связи мостов для сервера {interaction.guild.name}", 
@@ -238,7 +245,7 @@ async def blist(interaction: discord.Interaction):
                 status_suffix = " 🔇 *(Muted)*" if await redis.exists(f"bridge_mute:{cid}") else ""
                 return f"<#{cid}>{status_suffix}"
             
-            # Если канал чужой — пытаемся найти сервер и имя канала
+            # Если канал чужой — пытаемся найти сервер и имя канала через кэш/API
             try:
                 target_id = int(cid)
                 channel = bot.get_channel(target_id)
@@ -252,7 +259,7 @@ async def blist(interaction: discord.Interaction):
             except Exception:
                 pass
             
-            # Резервный вариант, если бот не имеет доступа к тому серверу
+            # Резервный вариант
             return f"❓ Неизвестный сервер (ID: {cid})"
 
         async def format_channels(channel_ids_list):
@@ -263,17 +270,22 @@ async def blist(interaction: discord.Interaction):
                     resolved.append(name)
             return "\n".join(resolved) if resolved else "*Нет подключенных каналов*"
 
-        # 1. Если мета-ключей вообще нет (совместимость со старой структурой bridge:*)
-        if not meta_keys:
-            bridge_keys_raw = await redis.keys("bridge:*") or []
-            bridge_keys = [k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in bridge_keys_raw]
+        # --- Шаг 1. Обрабатываем ВСЕ bridge:* ключи (и новые, и старые legacy без метаданных) ---
+        for bk in bridge_keys:
+            source_id = bk.split(":")[-1]
             
-            for bk in bridge_keys:
-                source_id = bk.split(":")[-1]
+            # Выясняем режим. Если есть мета-ключ, берем его значение. Если нет — это старый single-мост.
+            meta_key = f"bridgemeta:{source_id}"
+            if meta_key in meta_keys:
+                mode_raw = await redis.get(meta_key)
+                mode = mode_raw.decode('utf-8') if isinstance(mode_raw, bytes) else str(mode_raw)
+            else:
+                mode = "single"  # Legacy-совместимость
+
+            if mode == "single":
                 targets_raw = await redis.lrange(bk, 0, -1) or []
                 targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in targets_raw]
                 
-                # Показываем мост, только если источник или один из получателей связан с текущим сервером
                 is_local = (source_id in local_channel_ids) or any(t in local_channel_ids for t in targets)
                 
                 if is_local:
@@ -281,53 +293,27 @@ async def blist(interaction: discord.Interaction):
                     source_info = await resolve_channel_name(source_id)
                     targets_info = await format_channels(targets)
                     embed.add_field(
-                        name=f"📢 Источник: {source_info}",
-                        value=f"➡️ Получатели:\n{targets_info}",
-                        inline=False
-                    )
-            
-            if shown_count == 0:
-                await interaction.followup.send("📭 На этом сервере не найдено активных мостов.")
-            else:
-                await interaction.followup.send(embed=embed)
-            return
-
-        # 2. Новая архитектура с bridgemeta:*
-        for mk in meta_keys:
-            name_or_id = mk.split(":")[-1]
-            mode_raw = await redis.get(mk)
-            mode = mode_raw.decode('utf-8') if isinstance(mode_raw, bytes) else str(mode_raw)
-
-            if mode == "single":
-                targets_raw = await redis.lrange(f"bridge:{name_or_id}", 0, -1) or []
-                targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in targets_raw]
-                
-                is_local = (name_or_id in local_channel_ids) or any(t in local_channel_ids for t in targets)
-                
-                if is_local:
-                    shown_count += 1
-                    source_info = await resolve_channel_name(name_or_id)
-                    targets_info = await format_channels(targets)
-                    embed.add_field(
                         name=f"📢 Single-Мост (Источник: {source_info})",
                         value=f"➡️ Трансляция в:\n{targets_info}",
                         inline=False
                     )
 
-            elif mode == "cross":
-                channels_raw = await redis.lrange(f"crossnet:{name_or_id}", 0, -1) or []
-                channels = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in channels_raw]
-                
-                is_local = any(c in local_channel_ids for c in channels)
-                
-                if is_local:
-                    shown_count += 1
-                    channels_info = await format_channels(channels)
-                    embed.add_field(
-                        name=f"👑 Cross-сеть: `{name_or_id}`",
-                        value=f"🔗 Связанные каналы:\n{channels_info}",
-                        inline=False
-                    )
+        # --- Шаг 2. Обрабатываем новые Cross-сети ---
+        for ck in cross_keys:
+            cross_name = ck.split(":")[-1]
+            channels_raw = await redis.lrange(ck, 0, -1) or []
+            channels = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in channels_raw]
+            
+            is_local = any(c in local_channel_ids for c in channels)
+            
+            if is_local:
+                shown_count += 1
+                channels_info = await format_channels(channels)
+                embed.add_field(
+                    name=f"👑 Cross-сеть: `{cross_name}`",
+                    value=f"🔗 Связанные каналы:\n{channels_info}",
+                    inline=False
+                )
 
         if shown_count == 0:
             await interaction.followup.send("📭 На этом сервере не найдено активных мостов.")
