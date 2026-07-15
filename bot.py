@@ -15,161 +15,418 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 
 import os
-import io
+import asyncio
+import re
+from contextlib import asynccontextmanager
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-import asyncio
-import re
-from aiohttp import web
 import sqlitecloud
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-env_path = os.path.join(BASE_DIR, "variables.env")
-load_dotenv(dotenv_path=env_path)
+# Импорты для веб-сайта
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
+load_dotenv("variables.env")
+
+# ================= НАСТРОЙКИ БАЗЫ ДАННЫХ =================
+# Подключение к SQLite Cloud
+SQLITE_CLOUD_URL = os.getenv("SQLITE_CLOUD_URL")
+
+def get_db_conn():
+    conn = sqlitecloud.connect(SQLITE_CLOUD_URL)
+    return conn
+
+# Инициализируем таблицы базы данных, если их нет
+def init_database():
+    conn = get_db_conn()
+    cursor = conn.cursor()
+    # Таблица мета-информации о мостах
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS bridges (
+        name TEXT PRIMARY KEY,
+        mode TEXT NOT NULL,
+        creator_channel_id TEXT NOT NULL
+    );
+    """)
+    # Таблица связей каналов (для мостов и кросс-сетей)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS bridge_channels (
+        bridge_name TEXT,
+        channel_id TEXT,
+        PRIMARY KEY (bridge_name, channel_id),
+        FOREIGN KEY (bridge_name) REFERENCES bridges(name) ON DELETE CASCADE
+    );
+    """)
+    # Таблица приглушенных (muted) каналов
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS bridge_mutes (
+        channel_id TEXT PRIMARY KEY
+    );
+    """)
+    conn.commit()
+    conn.close()
+
+init_database()
+
+# ================= НАСТРОЙКИ DISCORD БОТА =================
 TOKEN = os.getenv("DISCORD_TOKEN")
-DB_CONN_STR = os.getenv("SQLITE_CLOUD_CONNECTION_STRING")
-
-if not TOKEN or not DB_CONN_STR:
-    print("❌ Ошибка переменных окружения!")
-    exit(1)
-
-# Инициализируем подключение к SQLite Cloud
-db = sqlitecloud.connect(DB_CONN_STR)
-cursor = db.cursor()
-
-# Создаем таблицы, если их нет
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS bridges (
-    bridge_id TEXT PRIMARY KEY,
-    mode TEXT NOT NULL CHECK (mode IN ('single', 'cross'))
-);
-""")
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS bridge_channels (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    bridge_id TEXT,
-    channel_id TEXT NOT NULL,
-    FOREIGN KEY(bridge_id) REFERENCES bridges(bridge_id) ON DELETE CASCADE
-);
-""")
-db.commit()
-
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-cached_webhooks = {}
+bot = commands.Bot(command_prefix="b!", intents=intents)
 
-def extract_id(channel_mention: str) -> int:
-    match = re.search(r'\d+', channel_mention)
-    if match:
-        return int(match.group())
-    raise ValueError("Формат ID неверный")
+# ================= СОВМЕСТНЫЙ ЗАПУСК (LIFESPAN) =================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(bot.start(TOKEN))
+    print("🤖 Discord Bot (SQLite Cloud) запущен в фоновом режиме!")
+    yield
+    print("🔌 Закрытие соединения с Discord...")
+    await bot.close()
 
-async def get_target_webhook(channel):
-    if channel.id in cached_webhooks:
-        return cached_webhooks[channel.id]
+# ================= НАСТРОЙКА АБСОЛЮТНЫХ ПУТЕЙ =================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+app = FastAPI(lifespan=lifespan)
+
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
+
+os.makedirs(STATIC_DIR, exist_ok=True)
+os.makedirs(TEMPLATES_DIR, exist_ok=True)
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+templates = Jinja2Templates(directory=TEMPLATES_DIR)
+
+
+# ================= ВЕБ-САЙТ: МАРШРУТЫ (ROUTES) =================
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    total_bridges = 0
     try:
-        webhooks = await channel.webhooks()
-        for wh in webhooks:
-            if wh.name == f"Bridge-{channel.id}":
-                cached_webhooks[channel.id] = wh
-                return wh
-        wh = await channel.create_webhook(name=f"Bridge-{channel.id}")
-        cached_webhooks[channel.id] = wh
-        return wh
-    except Exception as e:
-        print(f"🔴 Ошибка вебхука: {e}")
-        return None
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM bridges;")
+        total_bridges = cursor.fetchone()[0]
+        conn.close()
+    except Exception:
+        pass
 
-async def handle(request):
-    return web.Response(text="Мост на SQLite Cloud работает!")
+    guilds_count = len(bot.guilds) if bot.is_ready() else 0
 
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {
+            "guilds_count": guilds_count,
+            "total_bridges": total_bridges,
+            "bot_latency": round(bot.latency * 1000) if bot.is_ready() else 0
+        }
+    )
+
+@app.get("/ping")
+async def ping():
+    return {"status": "ok", "bot_ready": bot.is_ready()}
+
+
+# ================= Вспомогательные функции для вебхуков =================
+async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook:
+    webhooks = await channel.webhooks()
+    for wh in webhooks:
+        if wh.name == "Bridge Webhook":
+            return wh
+    return await channel.create_webhook(name="Bridge Webhook")
+
+
+# ================= СОБЫТИЯ И ИВЕНТЫ БОТА =================
 @bot.event
 async def on_ready():
-    print(f"✅ Бот онлайн (SQLite Cloud): {bot.user.name}")
+    print(f"✅ Вошли как {bot.user} (ID: {bot.user.id}) в ветке SQLite Cloud")
     try:
-        await bot.tree.sync()
-        print("🔮 Команды синхронизированы!")
+        synced = await bot.tree.sync()
+        print(f"🔄 Синхронизировано {len(synced)} слэш-команд.")
     except Exception as e:
-        print(f"🔴 Ошибка синхронизации: {e}")
+        print(f"❌ Ошибка синхронизации: {e}")
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.id == bot.user.id:
+        return
+
+    # Защита от бесконечного цикла отправки вебхуков
+    if message.webhook_id:
+        try:
+            if message.author.name == "Bridge Webhook" or (message.author.discriminator == "0000" and "Bridge Webhook" in message.author.name):
+                return
+        except Exception:
+            pass
+
+    conn = get_db_conn()
+    cursor = conn.cursor()
+
+    # Проверяем, приглушен ли текущий канал
+    cursor.execute("SELECT 1 FROM bridge_mutes WHERE channel_id = ?;", (str(message.channel.id),))
+    if cursor.fetchone():
+        conn.close()
+        return
+
+    # Нам нужно найти все мосты (single или cross), в которых участвует текущий канал
+    cursor.execute("""
+        SELECT bridge_name, mode FROM bridge_channels 
+        JOIN bridges ON bridges.name = bridge_channels.bridge_name
+        WHERE channel_id = ?;
+    """, (str(message.channel.id),))
+    
+    active_connections = cursor.fetchall()
+
+    for bridge_name, mode in active_connections:
+        # Находим всех получателей в этом мосте
+        cursor.execute("SELECT channel_id FROM bridge_channels WHERE bridge_name = ?;", (bridge_name,))
+        targets = [row[0] for row in cursor.fetchall()]
+
+        for target_id in targets:
+            # Не отправляем сообщение в тот же канал, откуда оно пришло
+            if target_id == str(message.channel.id):
+                continue
+
+            # Проверяем, не приглушен ли получатель
+            cursor.execute("SELECT 1 FROM bridge_mutes WHERE channel_id = ?;", (target_id,))
+            if cursor.fetchone():
+                continue
+
+            target_channel = bot.get_channel(int(target_id))
+            if target_channel:
+                try:
+                    wh = await get_or_create_webhook(target_channel)
+                    username_suffix = f" ({message.guild.name})" if mode == "cross" else ""
+                    await wh.send(
+                        content=message.content or "",
+                        username=f"{message.author.display_name}{username_suffix}",
+                        avatar_url=message.author.display_avatar.url,
+                        embeds=message.embeds,
+                        files=[await f.to_file() for f in message.attachments] if message.attachments else []
+                    )
+                except Exception as e:
+                    print(f"Ошибка трансляции в {target_id}: {e}")
+
+    conn.close()
+    await bot.process_commands(message)
+
 
 # ================= КОМАНДА: /bcreate =================
-@bot.tree.command(name="bcreate", description="Создать мост трансляции (single) или глобальную сеть чатов (cross)")
-@app_commands.choices(mode=[
-    app_commands.Choice(name="single", value="single"),
-    app_commands.Choice(name="cross", value="cross")
-])
-async def bcreate(interaction: discord.Interaction, mode: str, source: str = None, name: str = None):
+@bot.tree.command(name="bcreate", description="Создать новый мост или кросс-сеть")
+async def bcreate(interaction: discord.Interaction, name: str, mode: str):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
         return
 
+    if mode not in ["single", "cross"]:
+        await interaction.response.send_message("❌ Неверный режим!", ephemeral=True)
+        return
+
     await interaction.response.defer(ephemeral=True)
 
-    if mode == "single":
-        if not source:
-            await interaction.followup.send("❌ Для режима single необходимо указать source (ID канала-источника)!")
-            return
-        try:
-            source_id = extract_id(source)
-        except ValueError:
-            await interaction.followup.send("❌ Укажите корректный ID канала-источника.")
-            return
-        bridge_id = str(source_id)
-    elif mode == "cross":
-        if not name:
-            await interaction.followup.send("❌ Для режима cross необходимо указать параметр name (имя моста)!")
-            return
-        bridge_id = re.sub(r'[^a-zA-Z0-9_-]', '', name).lower()
-
     try:
-        cursor.execute("SELECT 1 FROM bridges WHERE bridge_id = ?", (bridge_id,))
+        conn = get_db_conn()
+        cursor = conn.cursor()
+
+        clean_name = re.sub(r'[^a-zA-Z0-9_-]', '', name).lower() if mode == "cross" else str(interaction.channel.id)
+
+        # Проверяем, существует ли мост
+        cursor.execute("SELECT 1 FROM bridges WHERE name = ?;", (clean_name,))
         if cursor.fetchone():
-            await interaction.followup.send(f"⚠️ Мост `{bridge_id}` уже существует!")
+            await interaction.followup.send(f"❌ Мост с идентификатором `{clean_name}` уже существует.")
+            conn.close()
             return
 
-        cursor.execute("INSERT INTO bridges (bridge_id, mode) VALUES (?, ?)", (bridge_id, mode))
-        db.commit()
-        
-        msg = f"📈 Мост создан! Вызовите `/bconnect bname:{bridge_id}` для привязки целей." if mode == "single" else f"👑 Кросс-мост `{bridge_id}` создан! Используйте `/bconnect bname:{bridge_id}`"
-        await interaction.followup.send(msg)
+        # Добавляем запись в таблицу мостов
+        cursor.execute("""
+            INSERT INTO bridges (name, mode, creator_channel_id) 
+            VALUES (?, ?, ?);
+        """, (clean_name, mode, str(interaction.channel.id)))
+
+        # Добавляем первый канал
+        cursor.execute("""
+            INSERT INTO bridge_channels (bridge_name, channel_id) 
+            VALUES (?, ?);
+        """, (clean_name, str(interaction.channel.id)))
+
+        conn.commit()
+        conn.close()
+
+        if mode == "single":
+            await interaction.followup.send(f"✅ Single-мост успешно создан!\n🔑 **ID моста:** `{clean_name}`\nПодключите его на другом сервере: `/bconnect name:{clean_name}`")
+        else:
+            await interaction.followup.send(f"✅ Cross-сеть `{clean_name}` создана!\n🔑 **ID для подключения:** `{clean_name}`")
+
     except Exception as e:
-        await interaction.followup.send(f"❌ Ошибка БД: {e}")
+        await interaction.followup.send(f"❌ Ошибка базы данных: {e}")
+
 
 # ================= КОМАНДА: /bconnect =================
-@bot.tree.command(name="bconnect", description="Подключить канал к мосту")
-async def bconnect(interaction: discord.Interaction, bname: str, channel: str = None):
+@bot.tree.command(name="bconnect", description="Подключить текущий канал к существующей сети")
+async def bconnect(interaction: discord.Interaction, name: str):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
-    safe_bname = re.sub(r'[^a-zA-Z0-9_-]', '', bname).lower()
-    target_channel_id_str = str(extract_id(channel)) if channel else str(interaction.channel_id)
 
     try:
-        cursor.execute("SELECT mode FROM bridges WHERE bridge_id = ?", (safe_bname,))
+        conn = get_db_conn()
+        cursor = conn.cursor()
+
+        # Проверяем существование моста
+        cursor.execute("SELECT mode FROM bridges WHERE name = ?;", (name,))
         res = cursor.fetchone()
+
         if not res:
-            await interaction.followup.send(f"❌ Моста со значением `{safe_bname}` не существует!")
+            await interaction.followup.send(f"❌ Сеть или мост `{name}` не найдены.")
+            conn.close()
             return
-        
+
         mode = res[0]
+        channel_id_str = str(interaction.channel.id)
 
-        cursor.execute("SELECT 1 FROM bridge_channels WHERE bridge_id = ? AND channel_id = ?", (safe_bname, target_channel_id_str))
+        # Проверяем, не подключен ли уже канал к этому мосту
+        cursor.execute("SELECT 1 FROM bridge_channels WHERE bridge_name = ? AND channel_id = ?;", (name, channel_id_str))
         if cursor.fetchone():
-            await interaction.followup.send(f"⚠️ Канал <#{target_channel_id_str}> уже подключен к `{safe_bname}`!")
+            await interaction.followup.send("❌ Этот канал уже привязан к этому мосту!")
+            conn.close()
             return
 
-        cursor.execute("INSERT INTO bridge_channels (bridge_id, channel_id) VALUES (?, ?)", (safe_bname, target_channel_id_str))
-        db.commit()
-        
-        await interaction.followup.send(f"✅ Канал <#{target_channel_id_str}> успешно подключен к мосту `{safe_bname}` ({mode})!")
+        # Добавляем связь
+        cursor.execute("INSERT INTO bridge_channels (bridge_name, channel_id) VALUES (?, ?);", (name, channel_id_str))
+        conn.commit()
+        conn.close()
+
+        await interaction.followup.send(f"🔗 Канал успешно присоединен к мосту `{name}`!")
+
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка подключения: {e}")
+
+
+# ================= КОМАНДА: /brename (SQLite Cloud) =================
+@bot.tree.command(name="brename", description="Переименовать существующую кросс-сеть")
+@app_commands.describe(
+    old_name="Текущее уникальное имя вашей кросс-сети",
+    new_name="Новое имя для кросс-сети"
+)
+async def brename(interaction: discord.Interaction, old_name: str, new_name: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
+        return
+
+    old_name = old_name.strip().lower()
+    new_name = re.sub(r'[^a-zA-Z0-9_-]', '', new_name).strip().lower()
+
+    if not new_name:
+        await interaction.response.send_message("❌ Новое имя содержит недопустимые символы!", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+
+        # 1. Получаем информацию о мосте и создателе
+        cursor.execute("SELECT mode, creator_channel_id FROM bridges WHERE name = ?;", (old_name,))
+        res = cursor.fetchone()
+
+        if not res:
+            await interaction.followup.send(f"❌ Кросс-сеть `{old_name}` не найдена.")
+            conn.close()
+            return
+
+        mode, creator_channel_id = res
+        if mode != "cross":
+            await interaction.followup.send("❌ Вы можете переименовать только кросс-сети!")
+            conn.close()
+            return
+
+        # 2. Проверяем владельца (принадлежит ли изначальный канал текущему серверу)
+        creator_channel = interaction.guild.get_channel(int(creator_channel_id))
+        if not creator_channel:
+            await interaction.followup.send("❌ Переименовать сеть может только администратор сервера, на котором она была создана!")
+            conn.close()
+            return
+
+        # 3. Проверяем, не занято ли новое имя
+        cursor.execute("SELECT 1 FROM bridges WHERE name = ?;", (new_name,))
+        if cursor.fetchone():
+            await interaction.followup.send(f"❌ Имя `{new_name}` уже занято другой сетью или мостом.")
+            conn.close()
+            return
+
+        # 4. Обновляем имя через транзакцию (включая связанные каналы)
+        # Отключаем внешние ключи на время ручного каскадного обновления, если нужно, или делаем атомарный UPDATE
+        cursor.execute("UPDATE bridges SET name = ? WHERE name = ?;", (new_name, old_name))
+        
+        conn.commit()
+        conn.close()
+
+        await interaction.followup.send(f"🎉 Кросс-сеть успешно переименована из `{old_name}` в `{new_name}`!")
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Ошибка в процессе переименования: {e}")
+
+
+# ================= КОМАНДА: /bdelete =================
+@bot.tree.command(name="bdelete", description="Удалить мост или отключить текущий канал от него")
+async def bdelete(interaction: discord.Interaction, name: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT mode, creator_channel_id FROM bridges WHERE name = ?;", (name,))
+        res = cursor.fetchone()
+
+        if not res:
+            await interaction.followup.send(f"❌ Сеть или мост `{name}` не найдены.")
+            conn.close()
+            return
+
+        mode, creator_channel_id = res
+        channel_id_str = str(interaction.channel.id)
+
+        if mode == "single":
+            if name == channel_id_str:
+                # Владелец удаляет мост полностью
+                cursor.execute("DELETE FROM bridges WHERE name = ?;", (name,))
+                await interaction.followup.send(f"🗑️ Single-мост `{name}` полностью удален из базы данных.")
+            else:
+                cursor.execute("DELETE FROM bridge_channels WHERE bridge_name = ? AND channel_id = ?;", (name, channel_id_str))
+                await interaction.followup.send(f"🔌 Канал успешно отвязан от моста `{name}`.")
+
+        elif mode == "cross":
+            cursor.execute("DELETE FROM bridge_channels WHERE bridge_name = ? AND channel_id = ?;", (name, channel_id_str))
+            
+            # Проверяем, остались ли каналы в кросс-сети
+            cursor.execute("SELECT COUNT(*) FROM bridge_channels WHERE bridge_name = ?;", (name,))
+            remaining = cursor.fetchone()[0]
+
+            if remaining == 0:
+                cursor.execute("DELETE FROM bridges WHERE name = ?;", (name,))
+                await interaction.followup.send(f"🗑️ Кросс-сеть `{name}` опустела и была полностью удалена.")
+            else:
+                await interaction.followup.send(f"🔌 Этот канал успешно вышел из кросс-сети `{name}`.")
+
+        conn.commit()
+        conn.close()
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Ошибка при удалении: {e}")
+
 
 # ================= КОМАНДА: /blist =================
 @bot.tree.command(name="blist", description="Показать список мостов, связанных с каналами этого сервера")
@@ -185,206 +442,92 @@ async def blist(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
     try:
-        # Собираем ID всех текстовых каналов текущего сервера
-        local_channels = [str(ch.id) for ch in interaction.guild.text_channels]
-        
-        if not local_channels:
-            await interaction.followup.send("📭 На этом сервере нет текстовых каналов.")
-            return
+        local_channel_ids = {str(ch.id) for ch in interaction.guild.text_channels}
+        conn = get_db_conn()
+        cursor = conn.cursor()
 
-        placeholders = ",".join(["?"] * len(local_channels))
+        # Выбираем все каналы мостов
+        cursor.execute("""
+            SELECT bridges.name, bridges.mode, bridge_channels.channel_id 
+            FROM bridges
+            JOIN bridge_channels ON bridges.name = bridge_channels.bridge_name;
+        """)
+        rows = cursor.fetchall()
 
-        # Выбираем только те мосты, которые физически связаны с текущим сервером
-        query = f"""
-            SELECT DISTINCT b.bridge_id, b.mode FROM bridges b
-            LEFT JOIN bridge_channels bc ON b.bridge_id = bc.bridge_id
-            WHERE bc.channel_id IN ({placeholders}) OR b.bridge_id IN ({placeholders})
-        """
-        
-        cursor.execute(query, local_channels + local_channels)
-        bridges = cursor.fetchall()
-
-        if not bridges:
-            await interaction.followup.send("📭 На этом сервере не найдено активных мостов.")
-            return
+        # Группируем каналы по названию моста
+        bridge_data = {}
+        for b_name, b_mode, c_id in rows:
+            if b_name not in bridge_data:
+                bridge_data[b_name] = {"mode": b_mode, "channels": []}
+            bridge_data[b_name]["channels"].append(c_id)
 
         embed = discord.Embed(
-            title=f"🌐 Активные связи мостов для сервера {interaction.guild.name} (SQL)", 
-            color=0x9b59b6
+            title=f"🌐 Активные связи мостов для сервера {interaction.guild.name}", 
+            color=0x2ecc71
         )
+        
+        shown_count = 0
 
-        # Вспомогательная функция для красивого распознавания чужих и своих каналов
-        async def resolve_channel_name(cid: str, is_muted: int = 0) -> str:
-            # Если канал наш — просто упоминаем его
-            if cid in local_channels:
-                status_suffix = " 🔇 *(Muted)*" if is_muted == 1 else ""
+        async def resolve_channel_name(cid: str) -> str:
+            if cid in local_channel_ids:
+                # Проверяем, не приглушен ли канал
+                cursor.execute("SELECT 1 FROM bridge_mutes WHERE channel_id = ?;", (cid,))
+                status_suffix = " 🔇 *(Muted)*" if cursor.fetchone() else ""
                 return f"<#{cid}>{status_suffix}"
-            
-            # Если канал чужой — пытаемся найти сервер и имя канала через Discord API/кэш
             try:
                 target_id = int(cid)
                 channel = bot.get_channel(target_id)
                 if not channel:
                     channel = await bot.fetch_channel(target_id)
-                
                 if channel and isinstance(channel, discord.abc.GuildChannel):
-                    guild_part = f"**{channel.guild.name}**"
-                    channel_part = f"#{channel.name}"
-                    status_suffix = " 🔇 *(Muted)*" if is_muted == 1 else ""
-                    return f"🌐 {guild_part} > {channel_part}{status_suffix}"
+                    return f"🌐 **{channel.guild.name}** > #{channel.name}"
             except Exception:
                 pass
-            
-            # Резервный вариант
             return f"❓ Неизвестный сервер (ID: {cid})"
 
-        for bridge_row in bridges:
-            bridge_id = bridge_row[0]
-            mode = bridge_row[1]
+        for b_name, data in bridge_data.items():
+            b_mode = data["mode"]
+            channels = data["channels"]
 
-            # Тянем из БД информацию обо всех каналах-участниках этого конкретного моста
-            cursor.execute("SELECT channel_id, is_muted FROM bridge_channels WHERE bridge_id = ?", (bridge_id,))
-            channels_rows = cursor.fetchall()
-            
-            formatted_channels = []
-            for row in channels_rows:
-                cid, is_muted = row[0], row[1]
-                resolved_name = await resolve_channel_name(cid, is_muted)
-                formatted_channels.append(resolved_name)
-            
-            channels_mention = "\n".join(formatted_channels) if formatted_channels else "*Нет подключенных каналов*"
+            # Проверяем, имеет ли текущий сервер отношение к этому мосту
+            is_local = (b_name in local_channel_ids) or any(c in local_channel_ids for c in channels)
 
-            if mode == "single":
-                # Определяем, заглушен ли сам источник моста (если он на нашем сервере)
-                cursor.execute("SELECT is_muted FROM bridge_channels WHERE bridge_id = ? AND channel_id = ?", (bridge_id, bridge_id))
-                source_mute_res = cursor.fetchone()
-                source_is_muted = source_mute_res[0] if source_mute_res else 0
-                
-                source_info = await resolve_channel_name(bridge_id, source_is_muted)
-                embed.add_field(
-                    name=f"📢 Single-Мост (Источник: {source_info})",
-                    value=f"➡️ Трансляция в:\n{channels_mention}",
-                    inline=False
-                )
-            elif mode == "cross":
-                embed.add_field(
-                    name=f"👑 Cross-сеть: `{bridge_id}`",
-                    value=f"🔗 Связанные каналы:\n{channels_mention}",
-                    inline=False
-                )
+            if is_local:
+                shown_count += 1
+                resolved_channels = []
+                for cid in channels:
+                    name_resolved = await resolve_channel_name(cid)
+                    if name_resolved:
+                        resolved_channels.append(name_resolved)
 
-        await interaction.followup.send(embed=embed)
+                channels_info = "\n".join(resolved_channels) if resolved_channels else "*Нет подключенных каналов*"
 
-    except Exception as e:
-        await interaction.followup.send(f"❌ Ошибка при получении списка: {e}")
-
-# ================= КОМАНДА: /bdelete =================
-@bot.tree.command(name="bdelete", description="Полностью удалить мост")
-async def bdelete(interaction: discord.Interaction, name: str):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', name).lower()
-
-    try:
-        cursor.execute("SELECT 1 FROM bridges WHERE bridge_id = ?", (safe_name,))
-        if not cursor.fetchone():
-            await interaction.followup.send(f"❌ Моста `{safe_name}` не существует.")
-            return
-
-        # Каскадное удаление (благодаря FOREIGN KEY ... ON DELETE CASCADE) зачистит и привязанные каналы
-        cursor.execute("DELETE FROM bridges WHERE bridge_id = ?", (safe_name,))
-        db.commit()
-        await interaction.followup.send(f"🗑️ Мост `{safe_name}` успешно удален!")
-    except Exception as e:
-        await interaction.followup.send(f"❌ Ошибка удаления: {e}")
-
-# ================= ОБРАБОТКА СООБЩЕНИЙ =================
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author == bot.user or (message.webhook_id and message.webhook_id in [wh.id for wh in cached_webhooks.values()]):
-        return
-
-    current_channel_id_str = str(message.channel.id)
-    targets_to_send = set()
-
-    try:
-        # 1. Проверяем Single-мосты (где текущий канал является источником)
-        cursor.execute("SELECT mode FROM bridges WHERE bridge_id = ?", (current_channel_id_str,))
-        bridge_res = cursor.fetchone()
-        if bridge_res and bridge_res[0] == "single":
-            cursor.execute("SELECT channel_id FROM bridge_channels WHERE bridge_id = ?", (current_channel_id_str,))
-            for row in cursor.fetchall():
-                targets_to_send.add(int(row[0]))
-
-        # 2. Проверяем Cross-мосты (ищем cross-мосты, к которым подключен этот канал)
-        cursor.execute("""
-            SELECT bc.bridge_id FROM bridge_channels bc
-            JOIN bridges b ON bc.bridge_id = b.bridge_id
-            WHERE bc.channel_id = ? AND b.mode = 'cross'
-        """, (current_channel_id_str,))
-        
-        cross_bridges = [row[0] for row in cursor.fetchall()]
-        for b_id in cross_bridges:
-            cursor.execute("SELECT channel_id FROM bridge_channels WHERE bridge_id = ?", (b_id,))
-            for row in cursor.fetchall():
-                t_id = int(row[0])
-                if t_id != message.channel.id:
-                    targets_to_send.add(t_id)
-                    
-    except Exception as e:
-        print(f"🔴 Ошибка запроса к SQLite Cloud: {e}")
-
-    # --- ОТПРАВКА СООБЩЕНИЙ ВО ВСЕ НАЙДЕННЫЕ ТАРГЕТЫ ---
-    if targets_to_send:
-        # Скачиваем файлы и оборачиваем их заново с сохранением оригинальных свойств
-        files = []
-        for attachment in message.attachments:
-            try:
-                fp = io.BytesIO()
-                await attachment.save(fp)
-                discord_file = discord.File(fp, filename=attachment.filename, spoiler=attachment.is_spoiler())
-                files.append(discord_file)
-            except Exception as e:
-                print(f"🔴 Ошибка подготовки файла {attachment.filename}: {e}")
-
-        for target_id in targets_to_send:
-            target_channel = bot.get_channel(target_id)
-            if not target_channel:
-                try:
-                    target_channel = await bot.fetch_channel(target_id)
-                except:
-                    continue
-
-            webhook = await get_target_webhook(target_channel)
-            if webhook:
-                try:
-                    guild_name = f" [{message.guild.name}]" if message.guild else ""
-                    # Сбрасываем указатель буфера для повторной отправки
-                    for f in files:
-                        f.fp.seek(0)
-
-                    await webhook.send(
-                        content=message.content or None,
-                        username=f"{message.author.display_name}{guild_name}",
-                        avatar_url=message.author.display_avatar.url if message.author.display_avatar else None,
-                        embeds=[discord.Embed.from_dict(e.to_dict()) for e in message.embeds],
-                        files=files or discord.utils.MISSING
+                if b_mode == "single":
+                    source_info = await resolve_channel_name(b_name)
+                    embed.add_field(
+                        name=f"📢 Single-Мост (Источник: {source_info})",
+                        value=f"➡️ ... транслируется в:\n{channels_info}",
+                        inline=False
                     )
-                except Exception as e:
-                    print(f"🔴 Ошибка отправки вебхука в {target_id}: {e}")
+                else:
+                    embed.add_field(
+                        name=f"👑 Cross-сеть: `{b_name}`",
+                        value=f"🔗 Связанные каналы:\n{channels_info}",
+                        inline=False
+                    )
 
-    await bot.process_commands(message)
+        conn.close()
 
-async def main():
-    app = web.Application()
-    app.router.add_get('/', handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', 10000).start()
-    await bot.start(TOKEN)
+        if shown_count == 0:
+            await interaction.followup.send("📭 На этом сервере не найдено активных мостов.")
+        else:
+            await interaction.followup.send(embed=embed)
 
-if __name__ == '__main__':
-    asyncio.run(main())
+    except Exception as e:
+        await interaction.followup.send(f"❌ Ошибка получения списка: {e}")
+
+
+# ================= АВТОЗАПУСК СЕРВЕРА С БОТОМ =================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("bot_sqlite_cloud:app", host="0.0.0.0", port=10000, reload=False)
