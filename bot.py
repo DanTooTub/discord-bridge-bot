@@ -3,6 +3,7 @@ import asyncio
 import re
 from contextlib import asynccontextmanager
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 from upstash_redis.asyncio import Redis
@@ -31,28 +32,24 @@ bot = commands.Bot(command_prefix="b!", intents=intents)
 async def lifespan(app: FastAPI):
     # Код при старте веб-сайта: запускаем бота в фоне
     asyncio.create_task(bot.start(TOKEN))
-    print("🤖 Discord Bot запущен в фоновом режиме!")
+    print("🤖 Discord Bot (Redis) запущен в фоновом режиме!")
     yield
     # Код при закрытии веб-сайта
     print("🔌 Закрытие соединения с Discord и Redis...")
     await bot.close()
     await redis.close()
 
-# ================= НАСТРОЙКА АБСОЛЮТНЫХ ПУТЕЙ (ФИКС ДЛЯ RENDER) =================
-# Получаем абсолютный путь к папке, в которой лежит этот файл bot.py
+# ================= НАСТРОЙКА АБСОЛЮТНЫХ ПУТЕЙ =================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Инициализируем FastAPI с привязкой к жизненному циклу бота
 app = FastAPI(lifespan=lifespan)
 
-# Создаем структуры папок по строго абсолютным путям
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 
 os.makedirs(STATIC_DIR, exist_ok=True)
 os.makedirs(TEMPLATES_DIR, exist_ok=True)
 
-# Монтируем статику и шаблоны, используя абсолютные пути
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
@@ -69,7 +66,6 @@ async def home(request: Request):
 
     guilds_count = len(bot.guilds) if bot.is_ready() else 0
 
-    # ФИКС: Передаем объект request первым аргументом, а контекст — третьим
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -95,7 +91,6 @@ async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook
 
 
 # ================= СОБЫТИЯ И ИВЕНТЫ БОТА =================
-
 @bot.event
 async def on_ready():
     print(f"✅ Вошли как {bot.user} (ID: {bot.user.id})")
@@ -107,27 +102,26 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    # ФИКС: Игнорируем только нашего собственного бота, позволяя Вики-Боту работать
+    # Игнорируем сообщения самого бота, но пропускаем Вики-Бота
     if message.author.id == bot.user.id:
         return
 
-    # ФИКС: Игнорируем вебхуки, отправленные нашими же мостами, чтобы не было зацикливания
+    # Защита от бесконечного цикла отправки вебхуков
     if message.webhook_id:
         try:
-            # Если сообщение пришло от вебхука с именем "Bridge Webhook", игнорируем его
             if message.author.name == "Bridge Webhook" or (message.author.discriminator == "0000" and "Bridge Webhook" in message.author.name):
                 return
         except Exception:
             pass
 
-    # 1. Проверяем, заглушен ли канал-источник
+    # Проверяем, не приглушен ли канал-источник
     is_muted = await redis.exists(f"bridge_mute:{message.channel.id}")
     if is_muted:
         return
 
     channel_id_str = str(message.channel.id)
 
-    # 2. Обработка Cross-сетей
+    # 1. Обработка Cross-сетей
     cross_keys_raw = await redis.keys("crossnet:*") or []
     cross_keys = [k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in cross_keys_raw]
 
@@ -138,9 +132,8 @@ async def on_message(message: discord.Message):
         if channel_id_str in channels:
             for target_id in channels:
                 if target_id == channel_id_str:
-                    continue  # не отправляем обратно себе
+                    continue  # не пересылаем обратно себе
                 
-                # Проверяем, не приглушен ли получатель
                 if await redis.exists(f"bridge_mute:{target_id}"):
                     continue
                 
@@ -158,7 +151,7 @@ async def on_message(message: discord.Message):
                     except Exception as e:
                         print(f"Ошибка пересылки crossnet в {target_id}: {e}")
 
-    # 3. Обработка Single-мостов
+    # 2. Обработка Single-мостов
     bridge_key = f"bridge:{channel_id_str}"
     if await redis.exists(bridge_key):
         targets_raw = await redis.lrange(bridge_key, 0, -1) or []
@@ -196,7 +189,7 @@ async def bcreate(interaction: discord.Interaction, name: str, mode: str):
         return
 
     if mode not in ["single", "cross"]:
-        await interaction.response.send_message("❌ Неверный режим! Выберите `single` или `cross`.", ephemeral=True)
+        await interaction.response.send_message("❌ Выберите корректный режим: `single` или `cross`.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -280,6 +273,75 @@ async def bconnect(interaction: discord.Interaction, name: str):
         await interaction.followup.send(f"❌ Ошибка подключения: {e}")
 
 
+# ================= КОМАНДА: /brename (Эксклюзивно для Cross-сетей в Redis) =================
+@bot.tree.command(name="brename", description="Переименовать существующую кросс-сеть")
+@app_commands.describe(
+    old_name="Текущее уникальное имя вашей кросс-сети",
+    new_name="Новое имя для кросс-сети (только буквы, цифры и знаки дефиса)"
+)
+async def brename(interaction: discord.Interaction, old_name: str, new_name: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
+        return
+
+    old_name = old_name.strip().lower()
+    new_name = re.sub(r'[^a-zA-Z0-9_-]', '', new_name).strip().lower()
+
+    if not new_name:
+        await interaction.response.send_message("❌ Новое имя содержит недопустимые символы!", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        old_meta_key = f"bridgemeta:{old_name}"
+        old_cross_key = f"crossnet:{old_name}"
+
+        # 1. Проверяем существование сети и её тип
+        mode_raw = await redis.get(old_meta_key)
+        if not mode_raw:
+            await interaction.followup.send(f"❌ Кросс-сеть `{old_name}` не найдена.")
+            return
+
+        mode = mode_raw.decode('utf-8') if isinstance(mode_raw, bytes) else str(mode_raw)
+        if mode != "cross":
+            await interaction.followup.send("❌ Переименовать можно только сети в режиме `cross`!")
+            return
+
+        # 2. Проверяем владельца (первый подключенный канал в кросс-сети является создателем)
+        channels_raw = await redis.lrange(old_cross_key, 0, -1) or []
+        channels = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in channels_raw]
+
+        if not channels:
+            await interaction.followup.send("❌ Ошибка структуры сети: в ней отсутствуют каналы.")
+            return
+
+        # Проверяем, принадлежит ли первый (создавший) канал текущему серверу
+        creator_channel_id = int(channels[0])
+        creator_channel_exists = interaction.guild.get_channel(creator_channel_id)
+
+        if not creator_channel_exists:
+            await interaction.followup.send("❌ Переименовать сеть может только администратор сервера, который изначально её создал!")
+            return
+
+        # 3. Проверяем, не занято ли новое имя
+        new_meta_key = f"bridgemeta:{new_name}"
+        if await redis.exists(new_meta_key):
+            await interaction.followup.send(f"❌ Имя `{new_name}` уже занято другой сетью или мостом!")
+            return
+
+        # 4. Выполняем атомарный перенос ключей в Redis
+        new_cross_key = f"crossnet:{new_name}"
+        
+        await redis.rename(old_meta_key, new_meta_key)
+        await redis.rename(old_cross_key, new_cross_key)
+
+        await interaction.followup.send(f"🎉 Кросс-сеть успешно переименована из `{old_name}` в `{new_name}`! Все участники продолжают общение.")
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Ошибка в процессе переименования: {e}")
+
+
 # ================= КОМАНДА: /bdelete =================
 @bot.tree.command(name="bdelete", description="Удалить мост или отключить текущий канал от него")
 async def bdelete(interaction: discord.Interaction, name: str):
@@ -326,7 +388,7 @@ async def bdelete(interaction: discord.Interaction, name: str):
         await interaction.followup.send(f"❌ Ошибка удаления/выхода: {e}")
 
 
-# ================= КОМАНДА: /blist (Исправленная на Redis) =================
+# ================= КОМАНДА: /blist =================
 @bot.tree.command(name="blist", description="Показать список мостов, связанных с каналами этого сервера")
 async def blist(interaction: discord.Interaction):
     if not interaction.guild:
@@ -405,7 +467,7 @@ async def blist(interaction: discord.Interaction):
                     targets_info = await format_channels(targets)
                     embed.add_field(
                         name=f"📢 Single-Мост (Источник: {source_info})",
-                        value=f"➡️ Трансляция в:\n{targets_info}",
+                        value=f"➡️ ... транслируется в:\n{targets_info}",
                         inline=False
                     )
 
@@ -437,4 +499,4 @@ async def blist(interaction: discord.Interaction):
 # ================= АВТОЗАПУСК СЕРВЕРА С БОТОМ =================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("bot:app", host="0.0.0.0", port=10000, reload=False)
+    uvicorn.run("bot_redis:app", host="0.0.0.0", port=10000, reload=False)
