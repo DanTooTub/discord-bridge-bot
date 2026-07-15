@@ -107,8 +107,18 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot or message.webhook_id:
+    # ФИКС: Игнорируем только нашего собственного бота, позволяя Вики-Боту работать
+    if message.author.id == bot.user.id:
         return
+
+    # ФИКС: Игнорируем вебхуки, отправленные нашими же мостами, чтобы не было зацикливания
+    if message.webhook_id:
+        try:
+            # Если сообщение пришло от вебхука с именем "Bridge Webhook", игнорируем его
+            if message.author.name == "Bridge Webhook" or (message.author.discriminator == "0000" and "Bridge Webhook" in message.author.name):
+                return
+        except Exception:
+            pass
 
     # 1. Проверяем, заглушен ли канал-источник
     is_muted = await redis.exists(f"bridge_mute:{message.channel.id}")
@@ -395,7 +405,7 @@ async def blist(interaction: discord.Interaction):
                     targets_info = await format_channels(targets)
                     embed.add_field(
                         name=f"📢 Single-Мост (Источник: {source_info})",
-                        value=f"➡️ Трасляция в:\n{targets_info}",
+                        value=f"➡️ Трансляция в:\n{targets_info}",
                         inline=False
                     )
 
