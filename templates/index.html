@@ -3,117 +3,313 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Discord Bridge Bot</title>
+    <title>Discord Bridge Bot — Технология связи каналов</title>
     <link rel="stylesheet" href="/static/style.css">
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
+    <style>
+        /* Дополнительные стили для нового адаптивного контента, если их нет в твоем style.css */
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --accent-color: #10b981;
+            --text-color: #f8fafc;
+            --text-muted: #94a3b8;
+            --discord-blue: #5865F2;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            margin: 0;
+            padding: 0;
+            line-height: 1.6;
+        }
+
+        .hero {
+            background: linear-gradient(135deg, #1e1b4b 0%, #0f172a 100%);
+            padding: 60px 20px;
+            text-align: center;
+            border-bottom: 2px solid #312e81;
+        }
+
+        .badge {
+            background-color: var(--accent-color);
+            color: #000;
+            padding: 5px 12px;
+            font-size: 0.85rem;
+            font-weight: bold;
+            border-radius: 20px;
+            display: inline-block;
+            margin-bottom: 15px;
+        }
+
+        .subtitle {
+            font-size: 1.2rem;
+            color: var(--text-muted);
+            margin-bottom: 30px;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+
+        /* Блок Живой Статистики (твои переменные из FastAPI) */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 20px;
+            margin-bottom: 50px;
+            text-align: center;
+        }
+
+        .stat-card {
+            background-color: var(--card-bg);
+            border: 1px solid #334155;
+            padding: 20px;
+            border-radius: 12px;
+        }
+
+        .stat-value {
+            font-size: 2rem;
+            font-weight: bold;
+            color: var(--accent-color);
+        }
+
+        .stat-label {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            margin-top: 5px;
+        }
+
+        /* Стили для разделов документации */
+        .section-title {
+            font-size: 1.8rem;
+            margin-top: 40px;
+            margin-bottom: 25px;
+            border-left: 5px solid var(--accent-color);
+            padding-left: 15px;
+            color: #fff;
+        }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+
+        @media (max-width: 768px) {
+            .features-grid, .stats-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .feature-card {
+            background-color: var(--card-bg);
+            padding: 25px;
+            border-radius: 12px;
+            border: 1px solid #334155;
+        }
+
+        .feature-card h3 {
+            margin-bottom: 10px;
+            color: #fff;
+        }
+
+        .feature-card p {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+        }
+
+        /* Список команд */
+        .commands-list {
+            background-color: var(--card-bg);
+            border-radius: 12px;
+            padding: 25px;
+            margin-bottom: 50px;
+            border: 1px solid #334155;
+        }
+
+        .command-item {
+            margin-bottom: 20px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #334155;
+        }
+
+        .command-item:last-child {
+            margin-bottom: 0;
+            padding-bottom: 0;
+            border-bottom: none;
+        }
+
+        .command-name {
+            font-family: monospace;
+            background-color: #0f172a;
+            color: var(--accent-color);
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-size: 1.05rem;
+            display: inline-block;
+            margin-bottom: 8px;
+        }
+
+        /* Блок Флагманского бота Печкина */
+        .flagship-section {
+            background: radial-gradient(circle at top right, #1e293b, #0f172a);
+            border: 2px solid var(--accent-color);
+            border-radius: 16px;
+            padding: 40px;
+            margin-top: 60px;
+            position: relative;
+        }
+
+        .flagship-badge {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: gold;
+            color: #000;
+            padding: 4px 10px;
+            font-size: 0.75rem;
+            font-weight: bold;
+            border-radius: 4px;
+            text-transform: uppercase;
+        }
+
+        .flagship-title {
+            font-size: 2.2rem;
+            color: #fff;
+            margin-bottom: 15px;
+        }
+
+        .flagship-desc {
+            color: var(--text-muted);
+            margin-bottom: 25px;
+            font-size: 1.05rem;
+            max-width: 85%;
+        }
+
+        .btn-invite {
+            display: inline-flex;
+            align-items: center;
+            background-color: var(--discord-blue);
+            color: white;
+            text-decoration: none;
+            padding: 14px 28px;
+            font-weight: bold;
+            border-radius: 8px;
+            transition: background-color 0.2s, transform 0.1s;
+            font-size: 1.1rem;
+        }
+
+        .btn-invite:hover {
+            background-color: #4752C4;
+            transform: scale(1.02);
+        }
+
+        .btn-invite svg {
+            margin-right: 10px;
+            fill: currentColor;
+        }
+
+        footer {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            border-top: 1px solid #1e293b;
+            margin-top: 60px;
+        }
+    </style>
 </head>
 <body>
 
-    <div class="blob blob-1"></div>
-    <div class="blob blob-2"></div>
+    <div class="hero">
+        <span class="badge">ТЕХНОЛОГИЯ МОСТОВ DISCORD</span>
+        <h1>Discord Bridge Bot</h1>
+        <p class="subtitle">Умное объединение текстовых каналов между независимыми серверами</p>
+    </div>
 
-    <nav class="navbar">
-        <div class="container nav-container">
-            <a href="#" class="logo-text">⚡ Bridge<span>Bot</span></a>
-            <div class="nav-links">
-                <a href="#features">Режимы</a>
-                <a href="#docs">Команды</a>
-                <a href="https://discord.com/oauth2/authorize?client_id=1524696444005515295&permissions=70369281166336&integration_type=0&scope=bot" class="nav-btn" target="_blank">Пригласить Печкина</a>
-            </div>
-        </div>
-    </nav>
+    <div class="container">
 
-    <header class="hero">
-        <div class="container">
-            <div class="hero-content">
-                <div class="badge">🔥 Флагманский бот: Почтальон Печкин</div>
-                <h1>Мосты, которые <br>действительно <span>работают</span></h1>
-                <p class="subtitle">Связывай каналы Discord с другими серверами, вики-проектами и внешними ресурсами. Твое надежное асинхронное ядро.</p>
-                <div class="buttons">
-                    <a href="https://discord.com/api/oauth2/authorize?client_id=ТВОЙ_ID&permissions=8&scope=bot%20applications.commands" class="btn btn-primary" target="_blank">Добавить на сервер</a>
-                    <a href="#docs" class="btn btn-secondary">Терминал команд</a>
-                </div>
-            </div>
-        </div>
-    </header>
-
-    <section class="stats">
-        <div class="container grid-3">
+        <div class="stats-grid">
             <div class="stat-card">
-                <div class="stat-icon">💻</div>
-                <h3 id="stat-guilds">{{ guilds_count }}</h3>
-                <p>Серверов в сети</p>
+                <div class="stat-value">{{ guilds_count }}</div>
+                <div class="stat-label">Серверов подключено</div>
             </div>
             <div class="stat-card">
-                <div class="stat-icon">🌿</div>
-                <h3 id="stat-bridges">{{ total_bridges }}</h3>
-                <p>Активных мостов</p>
+                <div class="stat-value">{{ total_bridges }}</div>
+                <div class="stat-label">Активных связей</div>
             </div>
             <div class="stat-card">
-                <div class="stat-icon">⚡</div>
-                <h3 id="stat-ping">{{ bot_latency }} ms</h3>
-                <p>Задержка ядра</p>
+                <div class="stat-value">{{ bot_latency }} мс</div>
+                <div class="stat-label">Пинг ядра ботов</div>
             </div>
         </div>
-    </section>
 
-    <section id="features" class="features">
-        <div class="container">
-            <h2 class="section-title">Гибкая маршрутизация сообщений</h2>
-            <div class="grid-2">
-                <div class="feature-card">
-                    <div class="feature-header">
-                        <span class="feat-badge">Режим 1</span>
-                        <div class="feat-icon">📢</div>
-                    </div>
-                    <h3>Single-Мосты</h3>
-                    <p>Однонаправленная доставка. Идеально подходит для автоматического импорта логов правок с ваших вики-проектов (Fandom/Miraheze) прямо на сервер.</p>
-                </div>
-                <div class="feature-card">
-                    <div class="feature-header">
-                        <span class="feat-badge">Режим 2</span>
-                        <div class="feat-icon">👑</div>
-                    </div>
-                    <h3>Cross-Сети</h3>
-                    <p>Многосторонний сквозной чат. Превращает разрозненные каналы разных серверов в единую синхронизированную экосистему общения.</p>
-                </div>
+        <h2 class="section-title">О технологии мостов</h2>
+        <div class="features-grid">
+            <div class="feature-card">
+                <h3>Синхронизация в реальном времени</h3>
+                <p>Технология мгновенно пересылает текстовые сообщения, вложения, файлы и встроенные блоки (embeds) между каналами разных серверов с помощью динамических вебхуков.</p>
+            </div>
+            <div class="feature-card">
+                <h3>Два режима работы</h3>
+                <p>Вы можете использовать классический <strong>Single-мост</strong> (односторонняя или цепочечная трансляция из источника) или создать полноценную <strong>Cross-сеть</strong>, где все участники общаются в едином пространстве.</p>
+            </div>
+            <div class="feature-card">
+                <h3>Сохранение контекста общения</h3>
+                <p>Сообщения пересылаются от лица отправившего их пользователя (с его оригинальным аватаром и никнеймом), что позволяет комфортно общаться без путаницы.</p>
+            </div>
+            <div class="feature-card">
+                <h3>Интеграция с ботами</h3>
+                <p>Архитектура мостов поддерживает трансляцию системных сообщений от других ботов (например, вики-ботов, утилит статистики и логгеров) без образования бесконечных циклов.</p>
             </div>
         </div>
-    </section>
 
-    <section id="docs" class="docs">
-        <div class="container">
-            <h2 class="section-title">Интерактивный терминал</h2>
-            <p class="section-subtitle">Кликни по кнопкам слева, чтобы запустить симуляцию выполнения команды в терминале.</p>
+        <h2 class="section-title">Документация и Команды</h2>
+        <div class="commands-list">
+            <div class="command-item">
+                <span class="command-name">/bcreate name:[имя] mode:[single/cross]</span>
+                <p>Инициализирует новый мост (в режиме <code>single</code>) или создаёт новую кросс-сеть (в режиме <code>cross</code>) с уникальным идентификатором. Требует прав администратора.</p>
+            </div>
+            <div class="command-item">
+                <span class="command-name">/bconnect name:[id_моста_или_имя_сети]</span>
+                <p>Подключает текущий канал к ранее созданному мосту или кросс-сети. Настраивает вебхуки для автоматической трансляции.</p>
+            </div>
+            <div class="command-item">
+                <span class="command-name">/bdelete name:[id_моста_или_имя_сети]</span>
+                <p>Отключает текущий канал от связи или полностью удаляет мост из глобальной базы данных, если действие совершается на сервере-владельце.</p>
+            </div>
+            <div class="command-item">
+                <span class="command-name">/blist</span>
+                <p>Выводит красивую интерактивную карту активных связей, подключенных к каналам вашего сервера, с индикацией заглушенных (muted) направлений.</p>
+            </div>
+        </div>
+
+        <div class="flagship-section">
+            <div class="flagship-badge">Флагман проекта</div>
+            <h2 class="flagship-title">Почтальон Печкин</h2>
+            <p class="flagship-desc">
+                Официальный публичный бот, полностью реализующий технологию Discord Bridge Bot. 
+                Он разработан разработчиком <strong>DanTooTub</strong>, стабильно работает 24/7 и готов к добавлению на ваши серверы уже сейчас.
+            </p>
             
-            <div class="terminal-container">
-                <div class="terminal-buttons">
-                    <button class="t-btn active" data-cmd="help">--help</button>
-                    <button class="t-btn" data-cmd="create">/bcreate</button>
-                    <button class="t-btn" data-cmd="connect">/bconnect</button>
-                    <button class="t-btn" data-cmd="list">/blist</button>
-                </div>
-
-                <div class="terminal">
-                    <div class="terminal-header">
-                        <span class="dot red"></span>
-                        <span class="dot yellow"></span>
-                        <span class="dot green"></span>
-                        <span class="title">pechkin_terminal.sh</span>
-                    </div>
-                    <div class="terminal-body" id="terminal-screen">
-                        </div>
-                </div>
-            </div>
+            <a href="https://discord.com/oauth2/authorize?client_id=1524696444005515295&permissions=70369281166336&integration_type=0&scope=bot" class="btn-invite" target="_blank">
+                <svg width="24" height="24" viewBox="0 0 127.14 96.36">
+                    <path d="M107.7,8.07A105.15,105.15,0,0,0,77.26,0a77.19,77.19,0,0,0-3.3,6.83A96.67,96.67,0,0,0,53.22,6.83,77.19,77.19,0,0,0,49.88,0,105.15,105.15,0,0,0,19.44,8.07C3.66,31.58-1.86,54.65,1,77.53A105.73,105.73,0,0,0,32,96.36a77.7,77.7,0,0,0,6.63-10.85,68.43,68.43,0,0,1-10.5-5c.88-.65,1.72-1.33,2.53-2a75.47,75.47,0,0,0,73.1,0c.81.71,1.65,1.39,2.53,2a68.45,68.45,0,0,1-10.5,5,77.63,77.63,0,0,0,6.63,10.85,105.73,105.73,0,0,0,31-18.83C129.87,50.12,123.63,27.35,107.7,8.07ZM42.45,65.69C36.18,65.69,31,60,31,53S36.18,40.36,42.45,40.36,53.83,46,53.83,53,48.72,65.69,42.45,65.69Zm42.24,0C78.41,65.69,73.24,60,73.24,53S78.41,40.36,84.69,40.36,96.07,46,96.07,53,91,65.69,84.69,65.69Z"/>
+                </svg>
+                Пригласить Почтальона Печкина
+            </a>
         </div>
-    </section>
+
+    </div>
 
     <footer>
-        <div class="container">
-            <p>&copy; 2026 Pentagram Software. <br><span>Создано: DanTooTub</span></p>
-        </div>
+        <p>© 2026 Pentagram Software. Разработано с использованием discord.py & FastAPI.</p>
     </footer>
 
-    <script src="/static/script.js"></script>
 </body>
 </html>
