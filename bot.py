@@ -410,8 +410,16 @@ async def bcreate(interaction: discord.Interaction, mode: str, name: Optional[st
 
 
 # ================= КОМАНДА: /bconnect =================
-@bot.tree.command(name="bconnect", description="Подключить текущий канал к существующей сети")
-async def bconnect(interaction: discord.Interaction, name: str):
+@bot.tree.command(name="bconnect", description="Подключить канал к существующей сети или мосту")
+@app_commands.describe(
+    name="Имя вашей кросс-сети или ID single-моста",
+    channel="Канал для подключения (если оставить пустым, подключится текущий канал)"
+)
+async def bconnect(
+    interaction: discord.Interaction, 
+    name: str, 
+    channel: Optional[discord.TextChannel] = None
+):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
         return
@@ -427,7 +435,10 @@ async def bconnect(interaction: discord.Interaction, name: str):
             return
 
         mode = mode_raw.decode('utf-8') if isinstance(mode_raw, bytes) else str(mode_raw)
-        channel_id_str = str(interaction.channel.id)
+        
+        # Определяем целевой канал: выбранный в параметрах или текущий
+        target_channel = channel or interaction.channel
+        channel_id_str = str(target_channel.id)
 
         if mode == "single":
             bridge_key = f"bridge:{name}"
@@ -435,11 +446,11 @@ async def bconnect(interaction: discord.Interaction, name: str):
             targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in targets_raw]
 
             if channel_id_str in targets:
-                await interaction.followup.send("❌ Этот канал уже привязан к этому мосту!")
+                await interaction.followup.send(f"❌ Канал {target_channel.mention} уже привязан к этому мосту!")
                 return
 
             await redis.rpush(bridge_key, channel_id_str)
-            await interaction.followup.send(f"🔗 Канал успешно присоединен к трансляции моста `{name}`!")
+            await interaction.followup.send(f"🔗 Канал {target_channel.mention} успешно присоединен к трансляции моста `{name}`!")
 
         elif mode == "cross":
             cross_key = f"crossnet:{name}"
@@ -447,11 +458,11 @@ async def bconnect(interaction: discord.Interaction, name: str):
             channels = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in channels_raw]
 
             if channel_id_str in channels:
-                await interaction.followup.send("❌ Этот канал уже находится в этой кросс-сети!")
+                await interaction.followup.send(f"❌ Канал {target_channel.mention} уже находится в этой кросс-сети!")
                 return
 
             await redis.rpush(cross_key, channel_id_str)
-            await interaction.followup.send(f"🔗 Канал успешно подключен к кросс-сети `{name}`!")
+            await interaction.followup.send(f"🔗 Канал {target_channel.mention} успешно подключен к кросс-сети `{name}`!")
 
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка подключения: {e}")
