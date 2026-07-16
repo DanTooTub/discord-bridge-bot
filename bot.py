@@ -17,9 +17,8 @@
 import os
 import asyncio
 import re
-import base64
-import time
 from contextlib import asynccontextmanager
+from typing import Optional
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -29,7 +28,7 @@ import aiohttp
 
 # Импорты для веб-сайта
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -45,12 +44,6 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="b!", intents=intents)
-
-# Буфер для хранения дефолтной аватарки в оперативной памяти (решает проблему редиректов Discord)
-DEFAULT_AVATAR_BYTES = b""
-
-# Статический URL официального логотипа Telegram на прозрачном фоне (Wikimedia Commons)
-TELEGRAM_LOGO_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/Telegram_logo.svg/512px-Telegram_logo.svg.png"
 
 # ================= ДИНАМИЧЕСКИЙ ДИСПЕТЧЕР TELEGRAM БОТОВ =================
 class TelegramBotInstance:
@@ -74,6 +67,24 @@ class TelegramBotInstance:
                 await self.task
             except asyncio.CancelledError:
                 pass
+
+    async def _get_avatar_url(self, session: aiohttp.ClientSession, user_id: int) -> str:
+        """Получение аватарки пользователя Telegram для отображения в Discord вебхуке"""
+        try:
+            async with session.get(f"https://api.telegram.org/bot{self.token}/getUserProfilePhotos?user_id={user_id}&limit=1") as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("ok") and data["result"]["total_count"] > 0:
+                        file_id = data["result"]["photos"][0][0]["file_id"]
+                        async with session.get(f"https://api.telegram.org/bot{self.token}/getFile?file_id={file_id}") as file_resp:
+                            if file_resp.status == 200:
+                                file_data = await file_resp.json()
+                                if file_data.get("ok"):
+                                    file_path = file_data["result"]["file_path"]
+                                    return f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+        except Exception as e:
+            print(f"[TG {self.bot_name}] Не удалось получить аватар для user_id {user_id}: {e}")
+        return "https://cdn.discordapp.com/embed/avatars/0.png"
 
     async def _poll_loop(self):
         print(f"[TG {self.bot_name}] Поллинг Telegram запущен...")
@@ -124,8 +135,9 @@ class TelegramBotInstance:
         first_name = user.get("first_name", "")
         last_name = user.get("last_name", "")
         full_name = f"{first_name} {last_name}".strip() or "Telegram User"
+        avatar_url = await self._get_avatar_url(session, user.get("id", 0))
 
-        # Транслируем сообщение во все Discord-каналы сети, используя постоянный значок Telegram
+        # Транслируем сообщение во все Discord-каналы сети
         for cid in channels:
             chan = bot.get_channel(int(cid))
             if chan:
@@ -134,7 +146,7 @@ class TelegramBotInstance:
                     await wh.send(
                         content=text,
                         username=f"[TG] {full_name}",
-                        avatar_url=TELEGRAM_LOGO_URL
+                        avatar_url=avatar_url
                     )
                 except Exception as e:
                     print(f"Ошибка трансляции TG -> Discord в канал {cid}: {e}")
@@ -230,69 +242,14 @@ async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook
     webhooks = await channel.webhooks()
     for wh in webhooks:
         if wh.name == "Bridge Webhook":
-            # Сохраняем ID нашего вебхука в Redis для защиты от зацикливания
-            await redis.sadd("our_webhooks", str(wh.id))
             return wh
-    wh = await channel.create_webhook(name="Bridge Webhook")
-    await redis.sadd("our_webhooks", str(wh.id))
-    return wh
-
-async def cache_all_existing_webhooks():
-    """Сбор и кэширование ID всех существующих вебхуков нашего бота на серверах"""
-    print("🔍 Кэширование ID наших вебхуков для защиты от зацикливания...")
-    count = 0
-    for guild in bot.guilds:
-        for channel in guild.text_channels:
-            try:
-                if channel.permissions_for(guild.me).manage_webhooks:
-                    webhooks = await channel.webhooks()
-                    for wh in webhooks:
-                        if wh.name == "Bridge Webhook":
-                            await redis.sadd("our_webhooks", str(wh.id))
-                            count += 1
-            except Exception:
-                continue
-    print(f"✅ Успешно закэшировано {count} вебхуков в Redis.")
-
-async def keep_alive_ping():
-    """Фоновая задача для самопингования, предотвращающая засыпание Render Free tier"""
-    await bot.wait_until_ready()
-    render_url = os.getenv("RENDER_EXTERNAL_URL")
-    if not render_url or "localhost" in render_url:
-        return
-    
-    render_url = render_url.rstrip('/')
-    if render_url.startswith("http://") and "onrender.com" in render_url:
-        render_url = render_url.replace("http://", "https://")
-
-    print(f"🚀 Запущен фоновый самопинг для {render_url}/ping")
-    async with aiohttp.ClientSession() as session:
-        while not bot.is_closed():
-            try:
-                async with session.get(f"{render_url}/ping") as resp:
-                    print(f"⏰ Самопинг выполнен, статус: {resp.status}")
-            except Exception as e:
-                print(f"⚠️ Ошибка самопинга: {e}")
-            await asyncio.sleep(600)  # 10 минут
+    return await channel.create_webhook(name="Bridge Webhook")
 
 
 # ================= СОБЫТИЯ И ИВЕНТЫ БОТА =================
 @bot.event
 async def on_ready():
     print(f"✅ Вошли как {bot.user} (ID: {bot.user.id})")
-    
-    # Кэшируем наши вебхуки, чтобы не блокировать чужие
-    await cache_all_existing_webhooks()
-
-    # Запускаем самопинг во избежание засыпания контейнера Render
-    bot.loop.create_task(keep_alive_ping())
-
-    # Полезная диагностика для локальной разработки
-    ext_url = os.getenv("RENDER_EXTERNAL_URL")
-    if ext_url and ext_url.startswith("http://") and "onrender.com" in ext_url:
-        ext_url = ext_url.replace("http://", "https://")
-    print(f"📡 Внешний URL для аватарок (RENDER_EXTERNAL_URL): {ext_url}")
-    
     try:
         synced = await bot.tree.sync()
         print(f"🔄 Синхронизировано {len(synced)} слэш-команд глобально.")
@@ -304,11 +261,13 @@ async def on_message(message: discord.Message):
     if message.author.id == bot.user.id:
         return
 
-    # Защита от зацикливания: проверяем, отправлено ли сообщение НАШИМ вебхуком
-    if message.webhook_id is not None:
-        is_our_webhook = await redis.sismember("our_webhooks", str(message.webhook_id))
-        if is_our_webhook:
-            return  # Игнорируем только свои вебхуки. Чужие (Вики-Бот) будут работать!
+    # Защита от зацикливания вебхуков
+    if message.webhook_id:
+        try:
+            if message.author.name == "Bridge Webhook" or (message.author.discriminator == "0000" and "Bridge Webhook" in message.author.name):
+                return
+        except Exception:
+            pass
 
     is_muted = await redis.exists(f"bridge_mute:{message.channel.id}")
     if is_muted:
@@ -400,7 +359,11 @@ async def on_message(message: discord.Message):
 
 # ================= КОМАНДА: /bcreate =================
 @bot.tree.command(name="bcreate", description="Создать новый мост или кросс-сеть")
-async def bcreate(interaction: discord.Interaction, name: str, mode: str):
+@app_commands.describe(
+    mode="Режим работы: single (мост один-к-многим) или cross (кросс-сеть)",
+    name="Имя кросс-сети (не требуется для режима single)"
+)
+async def bcreate(interaction: discord.Interaction, mode: str, name: Optional[str] = None):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
         return
@@ -422,6 +385,10 @@ async def bcreate(interaction: discord.Interaction, name: str, mode: str):
             await interaction.followup.send(f"✅ Single-мост успешно создан!\n🔑 **ID моста:** `{bridge_id}`\nИспользуйте его на другом сервере для привязки: `/bconnect name:{bridge_id}`")
         
         elif mode == "cross":
+            if not name:
+                await interaction.followup.send("❌ Для режима `cross` обязательно укажите аргумент `name`!")
+                return
+
             clean_name = re.sub(r'[^a-zA-Z0-9_-]', '', name).lower()
             if not clean_name:
                 await interaction.followup.send("❌ Недопустимое имя сети!")
