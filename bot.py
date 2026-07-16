@@ -27,7 +27,7 @@ import aiohttp
 
 # Импорты для веб-сайта
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -66,24 +66,6 @@ class TelegramBotInstance:
                 await self.task
             except asyncio.CancelledError:
                 pass
-
-    async def _get_avatar_url(self, session: aiohttp.ClientSession, user_id: int) -> str:
-        """Получение аватарки пользователя Telegram для отображения в Discord вебхуке"""
-        try:
-            async with session.get(f"https://api.telegram.org/bot{self.token}/getUserProfilePhotos?user_id={user_id}&limit=1") as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("ok") and data["result"]["total_count"] > 0:
-                        file_id = data["result"]["photos"][0][0]["file_id"]
-                        async with session.get(f"https://api.telegram.org/bot{self.token}/getFile?file_id={file_id}") as file_resp:
-                            if file_resp.status == 200:
-                                file_data = await file_resp.json()
-                                if file_data.get("ok"):
-                                    file_path = file_data["result"]["file_path"]
-                                    return f"https://api.telegram.org/file/bot{self.token}/{file_path}"
-        except Exception as e:
-            print(f"[TG {self.bot_name}] Не удалось получить аватар для user_id {user_id}: {e}")
-        return "https://cdn.discordapp.com/embed/avatars/0.png"
 
     async def _poll_loop(self):
         print(f"[TG {self.bot_name}] Поллинг Telegram запущен...")
@@ -134,7 +116,10 @@ class TelegramBotInstance:
         first_name = user.get("first_name", "")
         last_name = user.get("last_name", "")
         full_name = f"{first_name} {last_name}".strip() or "Telegram User"
-        avatar_url = await self._get_avatar_url(session, user.get("id", 0))
+
+        # Формируем БЕЗОПАСНЫЙ URL аватарки через наш прокси на FastAPI
+        render_url = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:10000").rstrip('/')
+        avatar_url = f"{render_url}/tg_avatar/{self.bot_name}/{user.get('id', 0)}"
 
         # Транслируем сообщение во все Discord-каналы сети
         for cid in channels:
@@ -234,6 +219,45 @@ async def home(request: Request):
 @app.get("/ping")
 async def ping():
     return {"status": "ok", "bot_ready": bot.is_ready()}
+
+# ================= БЕЗОПАСНЫЙ ПРОКСИ ДЛЯ АВАТАРОК TELEGRAM =================
+@app.get("/tg_avatar/{bot_name}/{user_id}")
+async def get_tg_avatar(bot_name: str, user_id: int):
+    """Эндпоинт для безопасного проксирования аватарок из TG в Discord вебхуки"""
+    token_bytes = await redis.get(f"tg_token:{bot_name}")
+    if not token_bytes:
+        return RedirectResponse("https://cdn.discordapp.com/embed/avatars/0.png")
+    
+    token = token_bytes.decode('utf-8') if isinstance(token_bytes, bytes) else str(token_bytes)
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            # 1. Запрашиваем информацию об аватарках пользователя
+            async with session.get(f"https://api.telegram.org/bot{token}/getUserProfilePhotos?user_id={user_id}&limit=1") as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("ok") and data["result"]["total_count"] > 0:
+                        # Берем аватарку среднего разрешения (индекс [0][0] или [0][1])
+                        file_id = data["result"]["photos"][0][0]["file_id"]
+                        
+                        # 2. Получаем внутренний путь к файлу в Telegram
+                        async with session.get(f"https://api.telegram.org/bot{token}/getFile?file_id={file_id}") as file_resp:
+                            if file_resp.status == 200:
+                                file_data = await file_resp.json()
+                                if file_data.get("ok"):
+                                    file_path = file_data["result"]["file_path"]
+                                    file_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+                                    
+                                    # 3. Скачиваем аватарку и транслируем её напрямую Discord-клиенту
+                                    async with session.get(file_url) as img_resp:
+                                        if img_resp.status == 200:
+                                            img_bytes = await img_resp.read()
+                                            return Response(content=img_bytes, media_type="image/jpeg")
+        except Exception as e:
+            print(f"[FASTAPI AVATAR PROXY] Ошибка получения аватара для {user_id}: {e}")
+            
+    # Если у пользователя нет фото или произошла ошибка — редиректим на дефолтный аватар Discord
+    return RedirectResponse("https://cdn.discordapp.com/embed/avatars/0.png")
 
 
 # ================= Вспомогательные функции для вебхуков =================
