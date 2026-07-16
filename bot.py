@@ -340,7 +340,7 @@ async def brename(interaction: discord.Interaction, old_name: str, new_name: str
             await interaction.followup.send("❌ Переименовать сеть может только администратор сервера, который изначально её создал!")
             return
 
-        # 3. Проверяем, не занято ли новое имя
+        # 3. Проверяем, не занато ли новое имя
         new_meta_key = f"bridgemeta:{new_name}"
         if await redis.exists(new_meta_key):
             await interaction.followup.send(f"❌ Имя `{new_name}` уже занято другой сетью или мостом!")
@@ -515,4 +515,5 @@ async def blist(interaction: discord.Interaction):
 # ================= АВТОЗАПУСК СЕРВЕРА С БОТОМ =================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("bot_redis:app", host="0.0.0.0", port=10000, reload=False)
+    # ИСПРАВЛЕНИЕ: Используем "bot:app", чтобы uvicorn успешно запускался из файла bot.py на Render
+    uvicorn.run("bot:app", host="0.0.0.0", port=10000, reload=False)
