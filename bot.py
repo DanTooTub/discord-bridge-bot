@@ -241,14 +241,39 @@ async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook
     webhooks = await channel.webhooks()
     for wh in webhooks:
         if wh.name == "Bridge Webhook":
+            # Сохраняем ID нашего вебхука в Redis для защиты от зацикливания
+            await redis.sadd("our_webhooks", str(wh.id))
             return wh
-    return await channel.create_webhook(name="Bridge Webhook")
+    wh = await channel.create_webhook(name="Bridge Webhook")
+    await redis.sadd("our_webhooks", str(wh.id))
+    return wh
+
+async def cache_all_existing_webhooks():
+    """Сбор и кэширование ID всех существующих вебхуков нашего бота на серверах"""
+    print("🔍 Кэширование ID наших вебхуков для защиты от зацикливания...")
+    count = 0
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            try:
+                if channel.permissions_for(guild.me).manage_webhooks:
+                    webhooks = await channel.webhooks()
+                    for wh in webhooks:
+                        if wh.name == "Bridge Webhook":
+                            await redis.sadd("our_webhooks", str(wh.id))
+                            count += 1
+            except Exception:
+                continue
+    print(f"✅ Успешно закэшировано {count} вебхуков в Redis.")
 
 
 # ================= СОБЫТИЯ И ИВЕНТЫ БОТА =================
 @bot.event
 async def on_ready():
     print(f"✅ Вошли как {bot.user} (ID: {bot.user.id})")
+    
+    # Кэшируем наши вебхуки, чтобы не блокировать чужие
+    await cache_all_existing_webhooks()
+    
     try:
         synced = await bot.tree.sync()
         print(f"🔄 Синхронизировано {len(synced)} слэш-команд глобально.")
@@ -260,13 +285,11 @@ async def on_message(message: discord.Message):
     if message.author.id == bot.user.id:
         return
 
-    # Защита от зацикливания вебхуков
-    if message.webhook_id:
-        try:
-            if message.author.name == "Bridge Webhook" or (message.author.discriminator == "0000" and "Bridge Webhook" in message.author.name):
-                return
-        except Exception:
-            pass
+    # Защита от зацикливания: проверяем, отправлено ли сообщение НАШИМ вебхуком
+    if message.webhook_id is not None:
+        is_our_webhook = await redis.sismember("our_webhooks", str(message.webhook_id))
+        if is_our_webhook:
+            return  # Игнорируем только свои вебхуки. Чужие (Вики-Бот) будут работать!
 
     is_muted = await redis.exists(f"bridge_mute:{message.channel.id}")
     if is_muted:
