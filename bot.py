@@ -49,6 +49,9 @@ bot = commands.Bot(command_prefix="b!", intents=intents)
 # Буфер для хранения дефолтной аватарки в оперативной памяти (решает проблему редиректов Discord)
 DEFAULT_AVATAR_BYTES = b""
 
+# Статический URL официального логотипа Telegram на прозрачном фоне (Wikimedia Commons)
+TELEGRAM_LOGO_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/Telegram_logo.svg/512px-Telegram_logo.svg.png"
+
 # ================= ДИНАМИЧЕСКИЙ ДИСПЕТЧЕР TELEGRAM БОТОВ =================
 class TelegramBotInstance:
     """Класс фонового поллинга для отдельного Telegram бота"""
@@ -122,12 +125,7 @@ class TelegramBotInstance:
         last_name = user.get("last_name", "")
         full_name = f"{first_name} {last_name}".strip() or "Telegram User"
 
-        # Формируем БЕЗОПАСНЫЙ URL аватарки через наш прокси на FastAPI с часовым кэш-бастером
-        render_url = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:10000").rstrip('/')
-        current_hour = time.strftime("%Y%m%d%H")
-        avatar_url = f"{render_url}/tg_avatar/{self.bot_name}/{user.get('id', 0)}?v={current_hour}"
-
-        # Транслируем сообщение во все Discord-каналы сети
+        # Транслируем сообщение во все Discord-каналы сети, используя постоянный значок Telegram
         for cid in channels:
             chan = bot.get_channel(int(cid))
             if chan:
@@ -136,7 +134,7 @@ class TelegramBotInstance:
                     await wh.send(
                         content=text,
                         username=f"[TG] {full_name}",
-                        avatar_url=avatar_url
+                        avatar_url=TELEGRAM_LOGO_URL
                     )
                 except Exception as e:
                     print(f"Ошибка трансляции TG -> Discord в канал {cid}: {e}")
@@ -174,21 +172,6 @@ tg_manager = TelegramManager()
 # ================= СОВМЕСТНЫЙ ЗАПУСК (LIFESPAN) =================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Загружаем дефолтный аватар Discord напрямую в память во избежание редиректов
-    global DEFAULT_AVATAR_BYTES
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get("https://cdn.discordapp.com/embed/avatars/0.png") as resp:
-                if resp.status == 200:
-                    DEFAULT_AVATAR_BYTES = await resp.read()
-                    print("✅ Дефолтный аватар Discord успешно загружен в буфер памяти.")
-        except Exception as e:
-            print(f"⚠️ Не удалось загрузить дефолтную аватарку: {e}")
-
-    # Резервный буфер на случай, если сеть во время инициализации упала (прозрачный 1x1 PNG)
-    if not DEFAULT_AVATAR_BYTES:
-        DEFAULT_AVATAR_BYTES = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc`\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
-
     # Запускаем Discord бота
     asyncio.create_task(bot.start(TOKEN))
     print("🤖 Discord Bot (Redis) запущен в фоновом режиме!")
@@ -241,77 +224,6 @@ async def home(request: Request):
 async def ping():
     return {"status": "ok", "bot_ready": bot.is_ready()}
 
-# ================= БЕЗОПАСНЫЙ ПРОКСИ ДЛЯ АВАТАРОК TELEGRAM =================
-@app.get("/tg_avatar/{bot_name}/{user_id}")
-async def get_tg_avatar(bot_name: str, user_id: int):
-    """Эндпоинт для безопасного проксирования аватарок из TG в Discord вебхуки с кэшированием в Redis"""
-    cache_key = f"tg_avatar_cache:{user_id}"
-    
-    # 1. Сначала пытаемся получить аватарку из быстрого кэша Redis
-    try:
-        cached_b64 = await redis.get(cache_key)
-        if cached_b64:
-            cached_str = cached_b64.decode('utf-8') if isinstance(cached_b64, bytes) else str(cached_b64)
-            img_bytes = base64.b64decode(cached_str)
-            return Response(content=img_bytes, media_type="image/jpeg")
-    except Exception as e:
-        print(f"[FASTAPI AVATAR PROXY] Ошибка чтения кэша Redis: {e}")
-
-    # 2. Если в кэше пусто, загружаем токен из базы данных
-    token_bytes = await redis.get(f"tg_token:{bot_name}")
-    if not token_bytes:
-        return Response(content=DEFAULT_AVATAR_BYTES, media_type="image/png")
-    
-    token = token_bytes.decode('utf-8') if isinstance(token_bytes, bytes) else str(token_bytes)
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            # А. Запрашиваем информацию об аватарках пользователя
-            async with session.get(f"https://api.telegram.org/bot{token}/getUserProfilePhotos?user_id={user_id}&limit=1") as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("ok") and data["result"]["total_count"] > 0:
-                        # Получаем список размеров для первой (актуальной) аватарки
-                        photos = data["result"]["photos"][0]
-                        # Выбираем оптимальный размер (индекс 1 (обычно 320x320) если доступно, иначе 0 (160x160))
-                        photo_index = 1 if len(photos) > 1 else 0
-                        file_id = photos[photo_index]["file_id"]
-                        
-                        # Б. Получаем внутренний путь к файлу в Telegram
-                        async with session.get(f"https://api.telegram.org/bot{token}/getFile?file_id={file_id}") as file_resp:
-                            if file_resp.status == 200:
-                                file_data = await file_resp.json()
-                                if file_data.get("ok"):
-                                    file_path = file_data["result"]["file_path"]
-                                    file_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
-                                    
-                                    # В. Скачиваем аватарку
-                                    async with session.get(file_url) as img_resp:
-                                        if img_resp.status == 200:
-                                            img_bytes = await img_resp.read()
-                                            
-                                            # Записываем байты в кэш Redis на 6 часов (21600 сек) в формате Base64
-                                            try:
-                                                encoded_str = base64.b64encode(img_bytes).decode('utf-8')
-                                                await redis.set(cache_key, encoded_str, ex=21600)
-                                            except Exception as cache_err:
-                                                print(f"[FASTAPI AVATAR PROXY] Ошибка записи в кэш: {cache_err}")
-                                                
-                                            return Response(content=img_bytes, media_type="image/jpeg")
-        except Exception as e:
-            print(f"[FASTAPI AVATAR PROXY] Ошибка получения аватара для {user_id}: {e}")
-            
-    # Если у пользователя нет аватарки или произошла ошибка — кэшируем дефолтный аватар на 1 час,
-    # чтобы не слать частые бесполезные запросы в Telegram API на каждый клик Discord'а.
-    try:
-        encoded_str = base64.b64encode(DEFAULT_AVATAR_BYTES).decode('utf-8')
-        await redis.set(cache_key, encoded_str, ex=3600)
-    except Exception as cache_err:
-        print(f"[FASTAPI AVATAR PROXY] Ошибка сохранения дефолтного кэша: {cache_err}")
-
-    # Отдаем напрямую дефолтные байты
-    return Response(content=DEFAULT_AVATAR_BYTES, media_type="image/png")
-
 
 # ================= Вспомогательные функции для вебхуков =================
 async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook:
@@ -342,6 +254,27 @@ async def cache_all_existing_webhooks():
                 continue
     print(f"✅ Успешно закэшировано {count} вебхуков в Redis.")
 
+async def keep_alive_ping():
+    """Фоновая задача для самопингования, предотвращающая засыпание Render Free tier"""
+    await bot.wait_until_ready()
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    if not render_url or "localhost" in render_url:
+        return
+    
+    render_url = render_url.rstrip('/')
+    if render_url.startswith("http://") and "onrender.com" in render_url:
+        render_url = render_url.replace("http://", "https://")
+
+    print(f"🚀 Запущен фоновый самопинг для {render_url}/ping")
+    async with aiohttp.ClientSession() as session:
+        while not bot.is_closed():
+            try:
+                async with session.get(f"{render_url}/ping") as resp:
+                    print(f"⏰ Самопинг выполнен, статус: {resp.status}")
+            except Exception as e:
+                print(f"⚠️ Ошибка самопинга: {e}")
+            await asyncio.sleep(600)  # 10 минут
+
 
 # ================= СОБЫТИЯ И ИВЕНТЫ БОТА =================
 @bot.event
@@ -351,12 +284,14 @@ async def on_ready():
     # Кэшируем наши вебхуки, чтобы не блокировать чужие
     await cache_all_existing_webhooks()
 
+    # Запускаем самопинг во избежание засыпания контейнера Render
+    bot.loop.create_task(keep_alive_ping())
+
     # Полезная диагностика для локальной разработки
     ext_url = os.getenv("RENDER_EXTERNAL_URL")
-    if not ext_url or "localhost" in ext_url:
-        print("ℹ️ Внимание: RENDER_EXTERNAL_URL отсутствует или указывает на localhost.")
-        print("   При тестировании на локальном компьютере Discord не сможет получить аватарки Telegram.")
-        print("   Для тестирования аватарок локально используйте Ngrok и укажите его HTTPS адрес в RENDER_EXTERNAL_URL.")
+    if ext_url and ext_url.startswith("http://") and "onrender.com" in ext_url:
+        ext_url = ext_url.replace("http://", "https://")
+    print(f"📡 Внешний URL для аватарок (RENDER_EXTERNAL_URL): {ext_url}")
     
     try:
         synced = await bot.tree.sync()
