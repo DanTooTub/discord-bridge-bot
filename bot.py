@@ -118,7 +118,7 @@ class TelegramBotInstance:
         user = message.get("from", {})
         
         if not text or text.startswith("/"):
-            return  # Игнорируем команды и пустые системные сообщения
+            return  # Игнорируем команды and пустые системные сообщения
 
         # Проверяем, привязана ли эта группа к какой-либо кросс-сети
         network_name_bytes = await redis.get(f"tg_chat_net:{chat_id}")
@@ -413,12 +413,12 @@ async def bcreate(interaction: discord.Interaction, mode: str, name: Optional[st
 @bot.tree.command(name="bconnect", description="Подключить канал к существующей сети или мосту")
 @app_commands.describe(
     name="Имя вашей кросс-сети или ID single-моста",
-    channel="Канал для подключения (если оставить пустым, подключится текущий канал)"
+    channel="Упоминание (#канал), ID или имя канала (если пусто, подключит текущий канал)"
 )
 async def bconnect(
     interaction: discord.Interaction, 
     name: str, 
-    channel: Optional[discord.TextChannel] = None
+    channel: Optional[str] = None
 ):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
@@ -436,8 +436,29 @@ async def bconnect(
 
         mode = mode_raw.decode('utf-8') if isinstance(mode_raw, bytes) else str(mode_raw)
         
-        # Определяем целевой канал: выбранный в параметрах или текущий
-        target_channel = channel or interaction.channel
+        # Определяем целевой канал
+        if channel:
+            # Извлекаем только цифры из ввода (для поддержки упоминаний типа <#123456> или чистых ID)
+            clean_id = re.sub(r'[^0-9]', '', channel)
+            if not clean_id:
+                await interaction.followup.send("❌ Указан неверный формат канала. Используйте упоминание (#канал) или цифровой ID!")
+                return
+            
+            # Сначала ищем канал в локальном кэше бота
+            target_channel = bot.get_channel(int(clean_id))
+            if not target_channel:
+                try:
+                    # Если в кэше нет (например, на другом сервере), пробуем загрузить из API Discord
+                    target_channel = await bot.fetch_channel(int(clean_id))
+                except Exception:
+                    pass
+            
+            if not target_channel:
+                await interaction.followup.send("❌ Не удалось найти указанный канал. Убедитесь, что бот добавлен на тот сервер!")
+                return
+        else:
+            target_channel = interaction.channel
+
         channel_id_str = str(target_channel.id)
 
         if mode == "single":
