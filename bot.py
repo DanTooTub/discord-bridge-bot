@@ -27,7 +27,7 @@ from upstash_redis.asyncio import Redis
 import aiohttp
 
 # Импорты для веб-сайта
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -68,23 +68,23 @@ class TelegramBotInstance:
             except asyncio.CancelledError:
                 pass
 
-    async def _get_avatar_url(self, session: aiohttp.ClientSession, user_id: int) -> str:
-        """Получение аватарки пользователя Telegram для отображения в Discord вебхуке"""
-        try:
-            async with session.get(f"https://api.telegram.org/bot{self.token}/getUserProfilePhotos?user_id={user_id}&limit=1") as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("ok") and data["result"]["total_count"] > 0:
-                        file_id = data["result"]["photos"][0][0]["file_id"]
-                        async with session.get(f"https://api.telegram.org/bot{self.token}/getFile?file_id={file_id}") as file_resp:
-                            if file_resp.status == 200:
-                                file_data = await file_resp.json()
-                                if file_data.get("ok"):
-                                    file_path = file_data["result"]["file_path"]
-                                    return f"https://api.telegram.org/file/bot{self.token}/{file_path}"
-        except Exception as e:
-            print(f"[TG {self.bot_name}] Не удалось получить аватар для user_id {user_id}: {e}")
-        return "https://cdn.discordapp.com/embed/avatars/0.png"
+#    async def _get_avatar_url(self, session: aiohttp.ClientSession, user_id: int) -> str:
+#        """Получение аватарки пользователя Telegram для отображения в Discord вебхуке"""
+#        try:
+#            async with session.get(f"https://api.telegram.org/bot{self.token}/getUserProfilePhotos?user_id={user_id}&limit=1") as resp:
+#                if resp.status == 200:
+#                    data = await resp.json()
+#                    if data.get("ok") and data["result"]["total_count"] > 0:
+#                        file_id = data["result"]["photos"][0][0]["file_id"]
+#                        async with session.get(f"https://api.telegram.org/bot{self.token}/getFile?file_id={file_id}") as file_resp:
+#                            if file_resp.status == 200:
+#                                file_data = await file_resp.json()
+#                                if file_data.get("ok"):
+#                                    file_path = file_data["result"]["file_path"]
+#                                    return f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+#        except Exception as e:
+#            print(f"[TG {self.bot_name}] Не удалось получить аватар для user_id {user_id}: {e}")
+#        return "https://cdn.discordapp.com/embed/avatars/0.png"
 
     async def _poll_loop(self):
         print(f"[TG {self.bot_name}] Поллинг Telegram запущен...")
@@ -118,7 +118,7 @@ class TelegramBotInstance:
         user = message.get("from", {})
         
         if not text or text.startswith("/"):
-            return  # Игнорируем команды and пустые системные сообщения
+            return  # Игнорируем команды и пустые системные сообщения
 
         # Проверяем, привязана ли эта группа к какой-либо кросс-сети
         network_name_bytes = await redis.get(f"tg_chat_net:{chat_id}")
@@ -211,6 +211,12 @@ templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
 
 # ================= ВЕБ-САЙТ: МАРШРУТЫ (ROUTES) =================
+
+@app.head("/")
+async def home_head():
+    """Ответ на HEAD-запросы от UptimeRobot для предотвращения засыпания и 405 ошибок"""
+    return Response(status_code=200)
+
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     try:
@@ -231,6 +237,11 @@ async def home(request: Request):
             "bot_latency": round(bot.latency * 1000) if bot.is_ready() else 0
         }
     )
+
+@app.head("/ping")
+async def ping_head():
+    """Дополнительный пинг-эндпоинт для HEAD методов"""
+    return Response(status_code=200)
 
 @app.get("/ping")
 async def ping():
