@@ -116,38 +116,11 @@ class TelegramBotInstance:
         chat_id = str(message["chat"]["id"])
         text = message.get("text", "").strip()
         user = message.get("from", {})
-        topic_id = str(message.get("message_thread_id", ""))
         
         if not text or text.startswith("/"):
             return  # Игнорируем команды и пустые системные сообщения
 
-        # А. Проверяем, является ли сообщение частью Topic-моста (прямая связь Discord -> Топик TG)
-        if topic_id:
-            tg_key = f"tg_topic_tg_set:{chat_id}:{topic_id}"
-            discord_channels_raw = await redis.smembers(tg_key) or []
-            discord_channels = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in discord_channels_raw]
-            
-            if discord_channels:
-                first_name = user.get("first_name", "")
-                last_name = user.get("last_name", "")
-                full_name = f"{first_name} {last_name}".strip() or "Telegram User"
-                avatar_url = await self._get_avatar_url(session, user.get("id", 0))
-                
-                for cid in discord_channels:
-                    chan = bot.get_channel(int(cid))
-                    if chan:
-                        try:
-                            wh = await get_or_create_webhook(chan)
-                            await wh.send(
-                                content=text,
-                                username=f"[TG | Тема] {full_name}",
-                                avatar_url=avatar_url
-                            )
-                        except Exception as e:
-                            print(f"Ошибка трансляции TG Topic -> Discord в канал {cid}: {e}")
-                return  # Завершаем, чтобы не дублировать сообщения в другие мосты
-
-        # Б. Проверяем стандартные Cross-сети
+        # Проверяем стандартные Cross-сети
         network_name_bytes = await redis.get(f"tg_chat_net:{chat_id}")
         if not network_name_bytes:
             return  # Чат не подключен к классическим мостам
@@ -236,7 +209,6 @@ os.makedirs(TEMPLATES_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
-
 # ================= ВЕБ-САЙТ: МАРШРУТЫ (ROUTES) =================
 
 @app.head("/")
@@ -249,8 +221,7 @@ async def home(request: Request):
     try:
         bridge_keys = await redis.keys("bridge:*") or []
         cross_keys = await redis.keys("crossnet:*") or []
-        topic_keys = await redis.keys("topicnet:*") or []
-        total_bridges = len(bridge_keys) + len(cross_keys) + len(topic_keys)
+        total_bridges = len(bridge_keys) + len(cross_keys)
     except Exception:
         total_bridges = 0
 
@@ -356,32 +327,7 @@ async def on_message(message: discord.Message):
 
     channel_id_str = str(message.channel.id)
 
-    # 1. Обработка Topic-мостов (прямая связь Discord канал -> Тема TG)
-    topic_set_key = f"tg_topic_discord_set:{channel_id_str}"
-    mapped_topics_raw = await redis.smembers(topic_set_key) or []
-    mapped_topics = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in mapped_topics_raw]
-
-    if mapped_topics and message.content:
-        cleaned_content = clean_discord_message(message)
-        payload_text = f"[{message.author.display_name} | {message.guild.name}]:\n{cleaned_content}"
-        
-        async with aiohttp.ClientSession() as session:
-            for item in mapped_topics:
-                tg_chat_id, tg_topic_id, tg_bot_name = item.split(":")
-                token_bytes = await redis.get(f"tg_token:{tg_bot_name}")
-                if token_bytes:
-                    token = token_bytes.decode('utf-8') if isinstance(token_bytes, bytes) else str(token_bytes)
-                    url = f"https://api.telegram.org/bot{token}/sendMessage"
-                    try:
-                        await session.post(url, json={
-                            "chat_id": tg_chat_id, 
-                            "message_thread_id": int(tg_topic_id),
-                            "text": payload_text
-                        })
-                    except Exception as e:
-                        print(f"Ошибка трансляции Discord -> TG Topic ({tg_chat_id}:{tg_topic_id}): {e}")
-
-    # 2. Обработка Cross-сетей
+    # 1. Обработка Cross-сетей
     cross_keys_raw = await redis.keys("crossnet:*") or []
     cross_keys = [k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in cross_keys_raw]
 
@@ -434,7 +380,7 @@ async def on_message(message: discord.Message):
                             except Exception as e:
                                 print(f"Ошибка трансляции Discord -> TG в чат {chat_id}: {e}")
 
-    # 3. Обработка Single-мостов
+    # 2. Обработка Single-мостов
     bridge_key = f"bridge:{channel_id_str}"
     if await redis.exists(bridge_key):
         targets_raw = await redis.lrange(bridge_key, 0, -1) or []
@@ -678,108 +624,6 @@ async def btelegram(interaction: discord.Interaction, name: str, bot_name: str, 
         await interaction.followup.send(f"❌ Ошибка связывания моста Telegram: {e}")
 
 
-# ================= КОМАНДА: /btgtopic (Прямое связывание с топиками TG) =================
-@bot.tree.command(name="btgtopic", description="Создать прямой мост между каналом Discord и темой (Topic) Telegram")
-@app_commands.describe(
-    name="Уникальное имя для этого моста (например, my-topic-bridge)",
-    chat_id="ID Telegram-чата (например, -1004384337986)",
-    topic_id="ID темы (Topic ID) внутри группы Telegram (например, 2)",
-    bot_name="Имя Telegram-бота (необязательно, если зарегистрирован всего один бот)",
-    channel="Канал Discord (если пусто, подключит текущий канал)"
-)
-async def btgtopic(
-    interaction: discord.Interaction,
-    name: str,
-    chat_id: str,
-    topic_id: str,
-    bot_name: Optional[str] = None,
-    channel: Optional[str] = None
-):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
-        return
-
-    clean_name = re.sub(r'[^a-zA-Z0-9_-]', '', name).strip().lower()
-    if not clean_name:
-        await interaction.response.send_message("❌ Недопустимое имя моста!", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        # 1. Проверяем существование моста с таким именем
-        meta_key = f"bridgemeta:{clean_name}"
-        if await redis.exists(meta_key):
-            await interaction.followup.send(f"❌ Мост или сеть с именем `{clean_name}` уже существует!")
-            return
-
-        # 2. Определяем имя Telegram-бота
-        if not bot_name:
-            bot_names_raw = await redis.smembers("tg_bots_list") or []
-            bot_names = [b.decode('utf-8') if isinstance(b, bytes) else str(b) for b in bot_names_raw]
-            if not bot_names:
-                await interaction.followup.send("❌ У вас нет зарегистрированных Telegram-ботов! Запустите сначала `/btgbot`.")
-                return
-            if len(bot_names) == 1:
-                bot_name = bot_names[0]
-            else:
-                await interaction.followup.send("❌ У вас зарегистрировано несколько ботов. Укажите имя нужного бота в параметре `bot_name`!")
-                return
-        else:
-            bot_name = bot_name.strip().lower()
-            if not await redis.exists(f"tg_token:{bot_name}"):
-                await interaction.followup.send(f"❌ Зарегистрированный Telegram-бот `{bot_name}` не найден!")
-                return
-
-        # 3. Определяем канал Discord
-        if channel:
-            clean_cid = re.sub(r'[^0-9]', '', channel)
-            if not clean_cid:
-                await interaction.followup.send("❌ Указан неверный формат канала Discord!")
-                return
-            target_channel = bot.get_channel(int(clean_cid))
-            if not target_channel:
-                try:
-                    target_channel = await bot.fetch_channel(int(clean_cid))
-                except Exception:
-                    pass
-            if not target_channel:
-                await interaction.followup.send("❌ Не удалось найти указанный канал Discord.")
-                return
-        else:
-            target_channel = interaction.channel
-
-        channel_id_str = str(target_channel.id)
-        chat_id = chat_id.strip()
-        topic_id = topic_id.strip()
-
-        # 4. Сохраняем связи в Redis
-        await redis.set(meta_key, "topic")
-        await redis.set(f"topicnet:{clean_name}", f"{channel_id_str}:{chat_id}:{topic_id}:{bot_name}")
-        await redis.sadd(f"tg_topic_discord_set:{channel_id_str}", f"{chat_id}:{topic_id}:{bot_name}")
-        await redis.sadd(f"tg_topic_tg_set:{chat_id}:{topic_id}", channel_id_str)
-
-        # 5. Проверяем бота и шлем сообщение для теста
-        token_bytes = await redis.get(f"tg_token:{bot_name}")
-        token = token_bytes.decode('utf-8') if isinstance(token_bytes, bytes) else str(token_bytes)
-
-        async with aiohttp.ClientSession() as session:
-            test_msg = f"🎉 Мост `{clean_name}` успешно связал эту тему с каналом Discord {target_channel.name}!"
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-            payload = {
-                "chat_id": chat_id,
-                "message_thread_id": int(topic_id),
-                "text": test_msg
-            }
-            async with session.post(url, json=payload) as resp:
-                if resp.status == 200:
-                    await interaction.followup.send(f"✅ Успешно создан мост `{clean_name}` между каналом {target_channel.mention} и темой `{topic_id}`!")
-                else:
-                    await interaction.followup.send(f"⚠️ Мост `{clean_name}` создан, но бот не смог отправить тестовое сообщение в Telegram. Убедитесь, что бот добавлен в группу как администратор.")
-    except Exception as e:
-        await interaction.followup.send(f"❌ Ошибка при создании топик-моста: {e}")
-
-
 # ================= КОМАНДА: /brename =================
 @bot.tree.command(name="brename", description="Переименовать существующую кросс-сеть")
 @app_commands.describe(
@@ -896,18 +740,6 @@ async def bdelete(interaction: discord.Interaction, name: str):
             else:
                 await interaction.followup.send(f"🔌 Этот канал успешно вышел из кросс-сети `{name}`.")
 
-        elif mode == "topic":
-            # Безопасно очищаем прямые связки топика по названию моста
-            data_raw = await redis.get(f"topicnet:{name}")
-            if data_raw:
-                data = data_raw.decode('utf-8') if isinstance(data_raw, bytes) else str(data_raw)
-                cid, chat_id, topic_id, bot_name = data.split(":")
-                await redis.srem(f"tg_topic_discord_set:{cid}", f"{chat_id}:{topic_id}:{bot_name}")
-                await redis.srem(f"tg_topic_tg_set:{chat_id}:{topic_id}", cid)
-            await redis.delete(f"topicnet:{name}")
-            await redis.delete(meta_key)
-            await interaction.followup.send(f"🗑️ Мост к теме Telegram `{name}` полностью удален из базы данных.")
-
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка удаления/выхода: {e}")
 
@@ -936,9 +768,6 @@ async def blist(interaction: discord.Interaction):
 
         cross_keys_raw = await redis.keys("crossnet:*") or []
         cross_keys = {k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in cross_keys_raw}
-
-        topic_keys_raw = await redis.keys("topicnet:*") or []
-        topic_keys = {k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in topic_keys_raw}
 
         embed = discord.Embed(
             title=f"🌐 Активные связи мостов для сервера {interaction.guild.name}", 
@@ -1021,22 +850,6 @@ async def blist(interaction: discord.Interaction):
                     value=f"🔗 Связанные каналы:\n{channels_info}{tg_info}",
                     inline=False
                 )
-
-        for tk in topic_keys:
-            topic_name = tk.split(":")[-1]
-            data_raw = await redis.get(tk)
-            if data_raw:
-                data = data_raw.decode('utf-8') if isinstance(data_raw, bytes) else str(data_raw)
-                cid, chat_id, topic_id, bot_name = data.split(":")
-                
-                if cid in local_channel_ids:
-                    shown_count += 1
-                    chan_info = await resolve_channel_name(cid)
-                    embed.add_field(
-                        name=f"🎯 Мост к теме Telegram: `{topic_name}`",
-                        value=f"📟 Канал: {chan_info}\n📱 Telegram: Чат `{chat_id}` (Тема `{topic_id}`) через бота `{bot_name}`",
-                        inline=False
-                    )
 
         if shown_count == 0:
             await interaction.followup.send("📭 На этом сервере не найдено активных мостов.")
