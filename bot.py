@@ -27,7 +27,7 @@ from upstash_redis.asyncio import Redis
 import aiohttp
 
 # Импорты для веб-сайта
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -44,6 +44,37 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="b!", intents=intents)
+
+# Логотип Telegram из Wikimedia Commons
+TELEGRAM_LOGO_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/Telegram_logo.svg/512px-Telegram_logo.svg.png"
+
+# ================= ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ОЧИСТКИ ТЕКСТА DISCORD =================
+async def clean_discord_message(content: str, guild: discord.Guild) -> str:
+    """Превращает сырые ID упоминаний Discord (<@ID>, <#ID>, <@&ID>, <:name:ID>) в читаемый текст"""
+    if not content or not guild:
+        return content
+
+    def replace_user(match):
+        user_id = int(match.group(1))
+        member = guild.get_member(user_id)
+        return f"@{member.display_name}" if member else f"@{match.group(1)}"
+    content = re.sub(r'<@!?(\d+)>', replace_user, content)
+
+    def replace_channel(match):
+        channel_id = int(match.group(1))
+        channel = guild.get_channel(channel_id)
+        return f"#{channel.name}" if channel else f"#{match.group(1)}"
+    content = re.sub(r'<#(\d+)>', replace_channel, content)
+
+    def replace_role(match):
+        role_id = int(match.group(1))
+        role = guild.get_role(role_id)
+        return f"@{role.name}" if role else f"@{match.group(1)}"
+    content = re.sub(r'<@&(\d+)>', replace_role, content)
+
+    content = re.sub(r'<a?:([a-zA-Z0-9_]+):\d+>', r':\1:', content)
+
+    return content
 
 # ================= ДИНАМИЧЕСКИЙ ДИСПЕТЧЕР TELEGRAM БОТОВ =================
 class TelegramBotInstance:
@@ -68,24 +99,6 @@ class TelegramBotInstance:
             except asyncio.CancelledError:
                 pass
 
-    async def _get_avatar_url(self, session: aiohttp.ClientSession, user_id: int) -> str:
-        """Получение аватарки пользователя Telegram для отображения в Discord вебхуке"""
-        try:
-            async with session.get(f"https://api.telegram.org/bot{self.token}/getUserProfilePhotos?user_id={user_id}&limit=1") as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("ok") and data["result"]["total_count"] > 0:
-                        file_id = data["result"]["photos"][0][0]["file_id"]
-                        async with session.get(f"https://api.telegram.org/bot{self.token}/getFile?file_id={file_id}") as file_resp:
-                            if file_resp.status == 200:
-                                file_data = await file_resp.json()
-                                if file_data.get("ok"):
-                                    file_path = file_data["result"]["file_path"]
-                                    return f"https://api.telegram.org/file/bot{self.token}/{file_path}"
-        except Exception as e:
-            print(f"[TG {self.bot_name}] Не удалось получить аватар для user_id {user_id}: {e}")
-        return "https://cdn.discordapp.com/embed/avatars/0.png"
-
     async def _poll_loop(self):
         print(f"[TG {self.bot_name}] Поллинг Telegram запущен...")
         async with aiohttp.ClientSession() as session:
@@ -104,8 +117,12 @@ class TelegramBotInstance:
 
                         for update in data["result"]:
                             self.offset = update["update_id"] + 1
+                            
                             if "message" in update:
                                 await self._handle_message(session, update["message"])
+                            elif "edited_message" in update:
+                                await self._handle_edited_message(session, update["edited_message"])
+
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -114,20 +131,19 @@ class TelegramBotInstance:
 
     async def _handle_message(self, session: aiohttp.ClientSession, message: dict):
         chat_id = str(message["chat"]["id"])
+        tg_msg_id = str(message["message_id"])
         text = message.get("text", "").strip()
         user = message.get("from", {})
         
         if not text or text.startswith("/"):
-            return  # Игнорируем команды и пустые системные сообщения
+            return
 
-        # Проверяем стандартные Cross-сети
         network_name_bytes = await redis.get(f"tg_chat_net:{chat_id}")
         if not network_name_bytes:
-            return  # Чат не подключен к классическим мостам
+            return
 
         network_name = network_name_bytes.decode('utf-8') if isinstance(network_name_bytes, bytes) else str(network_name_bytes)
         
-        # Получаем каналы Discord, входящие в эту кросс-сеть
         cross_key = f"crossnet:{network_name}"
         channels_raw = await redis.lrange(cross_key, 0, -1) or []
         channels = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in channels_raw]
@@ -135,21 +151,52 @@ class TelegramBotInstance:
         first_name = user.get("first_name", "")
         last_name = user.get("last_name", "")
         full_name = f"{first_name} {last_name}".strip() or "Telegram User"
-        avatar_url = await self._get_avatar_url(session, user.get("id", 0))
 
-        # Транслируем сообщение во все Discord-каналы сети
         for cid in channels:
             chan = bot.get_channel(int(cid))
             if chan:
                 try:
                     wh = await get_or_create_webhook(chan)
-                    await wh.send(
+                    sent_msg = await wh.send(
                         content=text,
                         username=f"[TG] {full_name}",
-                        avatar_url=avatar_url
+                        avatar_url=TELEGRAM_LOGO_URL,
+                        wait=True
                     )
+                    
+                    await redis.set(f"msg_map:tg:{chat_id}:{tg_msg_id}:{cid}", str(sent_msg.id), ex=86400)
+                    await redis.set(f"msg_map:discord:{sent_msg.id}", f"{chat_id}:{tg_msg_id}", ex=86400)
                 except Exception as e:
                     print(f"Ошибка трансляции TG -> Discord в канал {cid}: {e}")
+
+    async def _handle_edited_message(self, session: aiohttp.ClientSession, message: dict):
+        chat_id = str(message["chat"]["id"])
+        tg_msg_id = str(message["message_id"])
+        new_text = message.get("text", "").strip()
+
+        if not new_text:
+            return
+
+        network_name_bytes = await redis.get(f"tg_chat_net:{chat_id}")
+        if not network_name_bytes:
+            return
+
+        network_name = network_name_bytes.decode('utf-8') if isinstance(network_name_bytes, bytes) else str(network_name_bytes)
+        cross_key = f"crossnet:{network_name}"
+        channels_raw = await redis.lrange(cross_key, 0, -1) or []
+        channels = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in channels_raw]
+
+        for cid in channels:
+            d_msg_id_bytes = await redis.get(f"msg_map:tg:{chat_id}:{tg_msg_id}:{cid}")
+            if d_msg_id_bytes:
+                d_msg_id = int(d_msg_id_bytes.decode('utf-8') if isinstance(d_msg_id_bytes, bytes) else d_msg_id_bytes)
+                chan = bot.get_channel(int(cid))
+                if chan:
+                    try:
+                        wh = await get_or_create_webhook(chan)
+                        await wh.edit_message(d_msg_id, content=new_text)
+                    except Exception as e:
+                        print(f"Ошибка редактирования сообщения в Discord: {e}")
 
 class TelegramManager:
     """Управляющий класс для динамического запуска ботов"""
@@ -184,13 +231,11 @@ tg_manager = TelegramManager()
 # ================= СОВМЕСТНЫЙ ЗАПУСК (LIFESPAN) =================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Запускаем Discord бота
     asyncio.create_task(bot.start(TOKEN))
-    print("🤖 Discord Bot (Redis) запущен в фоновом режиме!")
-    # Инициализируем фоновые Telegram-боты
+    print("🤖 Discord Bot запущен!")
     await tg_manager.init_all_bots()
     yield
-    print("🔌 Закрытие соединения с Discord, Telegram и Redis...")
+    print("🔌 Закрытие соединений...")
     await tg_manager.stop_all()
     await bot.close()
     await redis.close()
@@ -209,14 +254,10 @@ os.makedirs(TEMPLATES_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
-# ================= ВЕБ-САЙТ: МАРШРУТЫ (ROUTES) =================
 
-@app.head("/")
-async def home_head():
-    """Ответ на HEAD-запросы от UptimeRobot для предотвращения засыпания и 405 ошибок"""
-    return Response(status_code=200)
-
+# ================= ВЕБ-САЙТ И HEALTH-CHECK (ОБРАБОТКА GET И HEAD) =================
 @app.get("/", response_class=HTMLResponse)
+@app.head("/")
 async def home(request: Request):
     try:
         bridge_keys = await redis.keys("bridge:*") or []
@@ -237,71 +278,46 @@ async def home(request: Request):
         }
     )
 
-@app.head("/ping")
-async def ping_head():
-    """Дополнительный пинг-эндпоинт для HEAD методов"""
-    return Response(status_code=200)
-
 @app.get("/ping")
+@app.head("/ping")
 async def ping():
     return {"status": "ok", "bot_ready": bot.is_ready()}
 
 
 # ================= Вспомогательные функции для вебхуков =================
-
-def clean_discord_message(message: discord.Message) -> str:
-    """Очищает разметку Discord (упоминания, каналы, роли, эмодзи) для читаемого отображения в Telegram"""
-    content = message.content or ""
-    if not content:
-        return content
-
-    # 1. Расшифровываем кастомные эмодзи <:pepe:123456789> -> :pepe:
-    content = re.sub(r'<a?:([a-zA-Z0-9_]+):[0-9]+>', r':\1:', content)
-
-    # 2. Расшифровываем упоминания пользователей <@123456789> -> @Имя
-    def replace_user(match):
-        user_id = int(match.group(1))
-        member = message.guild.get_member(user_id) if message.guild else None
-        if member:
-            return f"@{member.display_name}"
-        user = bot.get_user(user_id)
-        if user:
-            return f"@{user.name}"
-        return "@Пользователь"
-
-    content = re.sub(r'<@!?([0-9]+)>', replace_user, content)
-
-    # 3. Расшифровываем упоминания ролей <@&123456789> -> @Роль
-    def replace_role(match):
-        role_id = int(match.group(1))
-        role = message.guild.get_role(role_id) if message.guild else None
-        return f"@{role.name}" if role else "@Роль"
-
-    content = re.sub(r'<@&([0-9]+)>', replace_role, content)
-
-    # 4. Расшифровываем упоминания каналов <#123456789> -> #имя-канала
-    def replace_channel(match):
-        chan_id = int(match.group(1))
-        chan = bot.get_channel(chan_id)
-        return f"#{chan.name}" if chan else "#канал"
-
-    content = re.sub(r'<#([0-9]+)>', replace_channel, content)
-
-    return content
-
-
 async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook:
     webhooks = await channel.webhooks()
     for wh in webhooks:
         if wh.name == "Bridge Webhook":
+            await redis.sadd("our_webhooks", str(wh.id))
             return wh
-    return await channel.create_webhook(name="Bridge Webhook")
+    wh = await channel.create_webhook(name="Bridge Webhook")
+    await redis.sadd("our_webhooks", str(wh.id))
+    return wh
+
+async def cache_all_existing_webhooks():
+    """Собирает ID всех вебхуков нашего бота для точного фильтра зацикливания"""
+    print("🔍 Кэширование ID наших вебхуков...")
+    count = 0
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            try:
+                if channel.permissions_for(guild.me).manage_webhooks:
+                    webhooks = await channel.webhooks()
+                    for wh in webhooks:
+                        if wh.name == "Bridge Webhook":
+                            await redis.sadd("our_webhooks", str(wh.id))
+                            count += 1
+            except Exception:
+                continue
+    print(f"✅ Закэшировано {count} наших вебхуков.")
 
 
 # ================= СОБЫТИЯ И ИВЕНТЫ БОТА =================
 @bot.event
 async def on_ready():
     print(f"✅ Вошли как {bot.user} (ID: {bot.user.id})")
+    await cache_all_existing_webhooks()
     try:
         synced = await bot.tree.sync()
         print(f"🔄 Синхронизировано {len(synced)} слэш-команд глобально.")
@@ -310,22 +326,26 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
+    # 1. Игнорируем своего собственного бота Discord
     if message.author.id == bot.user.id:
         return
 
-    # Защита от зацикливания вебхуков
-    if message.webhook_id:
-        try:
-            if message.author.name == "Bridge Webhook" or (message.author.discriminator == "0000" and "Bridge Webhook" in message.author.name):
-                return
-        except Exception:
-            pass
+    # 2. ТОЧНЫЙ ФИЛЬТР ВЕБХУКОВ:
+    # Игнорируем ТОЛЬКО те вебхуки, которые создал НАШ бот (названы "Bridge Webhook")
+    if message.webhook_id is not None:
+        is_our_webhook = await redis.sismember("our_webhooks", str(message.webhook_id))
+        if is_our_webhook:
+            return  # Свои вебхуки сбрасываем (защита от петли)
+        # Если это чужой вебхук (Вики-Бот) — код идет ДАЛЬШЕ и пересылает его!
 
     is_muted = await redis.exists(f"bridge_mute:{message.channel.id}")
     if is_muted:
         return
 
     channel_id_str = str(message.channel.id)
+
+    # Очищаем текст от мусорных ID
+    clean_text = await clean_discord_message(message.content or "", message.guild)
 
     # 1. Обработка Cross-сетей
     cross_keys_raw = await redis.keys("crossnet:*") or []
@@ -350,13 +370,15 @@ async def on_message(message: discord.Message):
                 if target_channel:
                     try:
                         wh = await get_or_create_webhook(target_channel)
-                        await wh.send(
-                            content=message.content or "",
+                        sent_wh_msg = await wh.send(
+                            content=clean_text,
                             username=f"{message.author.display_name} ({message.guild.name})",
                             avatar_url=message.author.display_avatar.url,
                             embeds=message.embeds,
-                            files=[await f.to_file() for f in message.attachments] if message.attachments else []
+                            files=[await f.to_file() for f in message.attachments] if message.attachments else [],
+                            wait=True
                         )
+                        await redis.set(f"d_rel:{message.id}:{target_id}", str(sent_wh_msg.id), ex=86400)
                     except Exception as e:
                         print(f"Ошибка пересылки crossnet в {target_id}: {e}")
 
@@ -364,11 +386,9 @@ async def on_message(message: discord.Message):
             tg_links_raw = await redis.smembers(f"tg_links:{network_name}") or []
             tg_links = [link.decode('utf-8') if isinstance(link, bytes) else str(link) for link in tg_links_raw]
 
-            if tg_links and message.content:
+            if tg_links and clean_text:
                 async with aiohttp.ClientSession() as session:
-                    # Используем дешифратор для очистки текста от ID-мусора Discord
-                    cleaned_content = clean_discord_message(message)
-                    payload_text = f"[{message.author.display_name} | {message.guild.name}]:\n{cleaned_content}"
+                    payload_text = f"[{message.author.display_name} | {message.guild.name}]:\n{clean_text}"
                     for link in tg_links:
                         chat_id, bot_name = link.split(":")
                         token_bytes = await redis.get(f"tg_token:{bot_name}")
@@ -376,7 +396,12 @@ async def on_message(message: discord.Message):
                             token = token_bytes.decode('utf-8') if isinstance(token_bytes, bytes) else str(token_bytes)
                             url = f"https://api.telegram.org/bot{token}/sendMessage"
                             try:
-                                await session.post(url, json={"chat_id": chat_id, "text": payload_text})
+                                async with session.post(url, json={"chat_id": chat_id, "text": payload_text}) as resp:
+                                    if resp.status == 200:
+                                        tg_res = await resp.json()
+                                        if tg_res.get("ok"):
+                                            sent_tg_id = tg_res["result"]["message_id"]
+                                            await redis.set(f"d2tg:{message.id}:{chat_id}", str(sent_tg_id), ex=86400)
                             except Exception as e:
                                 print(f"Ошибка трансляции Discord -> TG в чат {chat_id}: {e}")
 
@@ -387,7 +412,7 @@ async def on_message(message: discord.Message):
         targets = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in targets_raw]
 
         for target_id in targets:
-            if target_id == "INIT_MARKER":
+            if target_id == "INIT_MARKER" or target_id == channel_id_str:
                 continue
             
             if await redis.exists(f"bridge_mute:{target_id}"):
@@ -397,17 +422,129 @@ async def on_message(message: discord.Message):
             if target_channel:
                 try:
                     wh = await get_or_create_webhook(target_channel)
-                    await wh.send(
-                        content=message.content or "",
+                    sent_wh_msg = await wh.send(
+                        content=clean_text,
                         username=message.author.display_name,
                         avatar_url=message.author.display_avatar.url,
                         embeds=message.embeds,
-                        files=[await f.to_file() for f in message.attachments] if message.attachments else []
+                        files=[await f.to_file() for f in message.attachments] if message.attachments else [],
+                        wait=True
                     )
+                    await redis.set(f"d_rel:{message.id}:{target_id}", str(sent_wh_msg.id), ex=86400)
                 except Exception as e:
                     print(f"Ошибка пересылки single в {target_id}: {e}")
 
     await bot.process_commands(message)
+
+
+# ================= СИНХРОНИЗАЦИЯ РЕДАКТИРОВАНИЯ DISCORD -> (DISCORD & TELEGRAM) =================
+@bot.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
+    if not payload.data.get("content"):
+        return
+
+    msg_id = payload.message_id
+    raw_content = payload.data["content"]
+
+    channel = bot.get_channel(payload.channel_id)
+    guild = channel.guild if channel else None
+    clean_text = await clean_discord_message(raw_content, guild)
+
+    keys_raw = await redis.keys(f"d_rel:{msg_id}:*") or []
+    for k in keys_raw:
+        key_str = k.decode('utf-8') if isinstance(k, bytes) else str(k)
+        target_channel_id = key_str.split(":")[-1]
+        wh_msg_id_bytes = await redis.get(key_str)
+        if wh_msg_id_bytes:
+            wh_msg_id = int(wh_msg_id_bytes.decode('utf-8') if isinstance(wh_msg_id_bytes, bytes) else wh_msg_id_bytes)
+            target_chan = bot.get_channel(int(target_channel_id))
+            if target_chan:
+                try:
+                    wh = await get_or_create_webhook(target_chan)
+                    await wh.edit_message(wh_msg_id, content=clean_text)
+                except Exception as e:
+                    print(f"Ошибка редактирования сообщения вебхука: {e}")
+
+    tg_keys_raw = await redis.keys(f"d2tg:{msg_id}:*") or []
+    if tg_keys_raw:
+        async with aiohttp.ClientSession() as session:
+            for k in tg_keys_raw:
+                key_str = k.decode('utf-8') if isinstance(k, bytes) else str(key_str)
+                chat_id = key_str.split(":")[-1]
+                tg_msg_id_bytes = await redis.get(key_str)
+                if tg_msg_id_bytes:
+                    tg_msg_id = int(tg_msg_id_bytes.decode('utf-8') if isinstance(tg_msg_id_bytes, bytes) else tg_msg_id_bytes)
+                    
+                    network_name_bytes = await redis.get(f"tg_chat_net:{chat_id}")
+                    if network_name_bytes:
+                        net_name = network_name_bytes.decode('utf-8') if isinstance(network_name_bytes, bytes) else str(network_name_bytes)
+                        tg_links_raw = await redis.smembers(f"tg_links:{net_name}") or []
+                        for link in tg_links_raw:
+                            link_str = link.decode('utf-8') if isinstance(link, bytes) else str(link)
+                            c_id, b_name = link_str.split(":")
+                            if c_id == chat_id:
+                                token_bytes = await redis.get(f"tg_token:{b_name}")
+                                if token_bytes:
+                                    token = token_bytes.decode('utf-8') if isinstance(token_bytes, bytes) else str(token_bytes)
+                                    author_name = payload.data.get("author", {}).get("username", "Discord User")
+                                    guild_name = guild.name if guild else "Discord"
+                                    
+                                    new_payload = f"[{author_name} | {guild_name}]:\n{clean_text}"
+                                    url = f"https://api.telegram.org/bot{token}/editMessageText"
+                                    try:
+                                        await session.post(url, json={"chat_id": chat_id, "message_id": tg_msg_id, "text": new_payload})
+                                    except Exception as e:
+                                        print(f"Ошибка редактирования сообщения в TG: {e}")
+
+
+# ================= СИНХРОНИЗАЦИЯ УДАЛЕНИЯ DISCORD -> (DISCORD & TELEGRAM) =================
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    msg_id = payload.message_id
+
+    keys_raw = await redis.keys(f"d_rel:{msg_id}:*") or []
+    for k in keys_raw:
+        key_str = k.decode('utf-8') if isinstance(k, bytes) else str(k)
+        target_channel_id = key_str.split(":")[-1]
+        wh_msg_id_bytes = await redis.get(key_str)
+        if wh_msg_id_bytes:
+            wh_msg_id = int(wh_msg_id_bytes.decode('utf-8') if isinstance(wh_msg_id_bytes, bytes) else wh_msg_id_bytes)
+            target_chan = bot.get_channel(int(target_channel_id))
+            if target_chan:
+                try:
+                    wh = await get_or_create_webhook(target_chan)
+                    await wh.delete_message(wh_msg_id)
+                except Exception as e:
+                    print(f"Ошибка удаления сообщения вебхука: {e}")
+            await redis.delete(key_str)
+
+    tg_keys_raw = await redis.keys(f"d2tg:{msg_id}:*") or []
+    if tg_keys_raw:
+        async with aiohttp.ClientSession() as session:
+            for k in tg_keys_raw:
+                key_str = k.decode('utf-8') if isinstance(k, bytes) else str(key_str)
+                chat_id = key_str.split(":")[-1]
+                tg_msg_id_bytes = await redis.get(key_str)
+                if tg_msg_id_bytes:
+                    tg_msg_id = int(tg_msg_id_bytes.decode('utf-8') if isinstance(tg_msg_id_bytes, bytes) else tg_msg_id_bytes)
+                    
+                    network_name_bytes = await redis.get(f"tg_chat_net:{chat_id}")
+                    if network_name_bytes:
+                        net_name = network_name_bytes.decode('utf-8') if isinstance(network_name_bytes, bytes) else str(network_name_bytes)
+                        tg_links_raw = await redis.smembers(f"tg_links:{net_name}") or []
+                        for link in tg_links_raw:
+                            link_str = link.decode('utf-8') if isinstance(link, bytes) else str(link)
+                            c_id, b_name = link_str.split(":")
+                            if c_id == chat_id:
+                                token_bytes = await redis.get(f"tg_token:{b_name}")
+                                if token_bytes:
+                                    token = token_bytes.decode('utf-8') if isinstance(token_bytes, bytes) else str(token_bytes)
+                                    url = f"https://api.telegram.org/bot{token}/deleteMessage"
+                                    try:
+                                        await session.post(url, json={"chat_id": chat_id, "message_id": tg_msg_id})
+                                    except Exception as e:
+                                        print(f"Ошибка удаления сообщения в TG: {e}")
+                    await redis.delete(key_str)
 
 
 # ================= КОМАНДА: /bcreate =================
@@ -489,25 +626,21 @@ async def bconnect(
 
         mode = mode_raw.decode('utf-8') if isinstance(mode_raw, bytes) else str(mode_raw)
         
-        # Определяем целевой канал
         if channel:
-            # Извлекаем только цифры из ввода (для поддержки упоминаний типа <#123456> или чистых ID)
             clean_id = re.sub(r'[^0-9]', '', channel)
             if not clean_id:
-                await interaction.followup.send("❌ Указан неверный формат канала. Используйте упоминание (#канал) или цифровой ID!")
+                await interaction.followup.send("❌ Указан неверный формат канала!")
                 return
             
-            # Сначала ищем канал в локальном кэше бота
             target_channel = bot.get_channel(int(clean_id))
             if not target_channel:
                 try:
-                    # Если в кэше нет (например, на другом сервере), пробуем загрузить из API Discord
                     target_channel = await bot.fetch_channel(int(clean_id))
                 except Exception:
                     pass
             
             if not target_channel:
-                await interaction.followup.send("❌ Не удалось найти указанный канал. Убедитесь, что бот добавлен на тот сервер!")
+                await interaction.followup.send("❌ Не удалось найти указанный канал!")
                 return
         else:
             target_channel = interaction.channel
@@ -524,7 +657,7 @@ async def bconnect(
                 return
 
             await redis.rpush(bridge_key, channel_id_str)
-            await interaction.followup.send(f"🔗 Канал {target_channel.mention} успешно присоединен к трансляции моста `{name}`!")
+            await interaction.followup.send(f"🔗 Канал {target_channel.mention} успешно присоединен к мосту `{name}`!")
 
         elif mode == "cross":
             cross_key = f"crossnet:{name}"
@@ -566,10 +699,9 @@ async def btgbot(interaction: discord.Interaction, token: str, name: str):
         await redis.set(f"tg_token:{name}", token)
         await redis.sadd("tg_bots_list", name)
         
-        # Запуск инстанса бота
         await tg_manager.start_bot(name, token)
 
-        await interaction.followup.send(f"✅ Telegram-бот `{name}` успешно зарегистрирован и запущен!\nТеперь вы можете связать его с любой кросс-сетью через Discord-команду `/btelegram`.")
+        await interaction.followup.send(f"✅ Telegram-бот `{name}` успешно зарегистрирован и запущен!")
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка регистрации Telegram-бота: {e}")
 
@@ -593,25 +725,21 @@ async def btelegram(interaction: discord.Interaction, name: str, bot_name: str, 
     await interaction.response.defer(ephemeral=True)
 
     try:
-        # 1. Проверяем существование кросс-сети
         meta_key = f"bridgemeta:{name}"
         mode_raw = await redis.get(meta_key)
         if not mode_raw or (mode_raw.decode('utf-8') if isinstance(mode_raw, bytes) else str(mode_raw)) != "cross":
             await interaction.followup.send(f"❌ Кросс-сеть `{name}` не найдена.")
             return
 
-        # 2. Проверяем существование бота
         token_bytes = await redis.get(f"tg_token:{bot_name}")
         if not token_bytes:
             await interaction.followup.send(f"❌ Зарегистрированный Telegram-бот `{bot_name}` не найден.")
             return
         token = token_bytes.decode('utf-8') if isinstance(token_bytes, bytes) else str(token_bytes)
 
-        # 3. Сохраняем связи в Redis
         await redis.sadd(f"tg_links:{name}", f"{chat_id}:{bot_name}")
         await redis.set(f"tg_chat_net:{chat_id}", name)
 
-        # 4. Отправляем тестовое сообщение в Telegram для подтверждения связки
         async with aiohttp.ClientSession() as session:
             test_msg = f"🎉 Бот успешно привязал этот чат к кросс-сети `{name}` через Discord!"
             url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -619,17 +747,13 @@ async def btelegram(interaction: discord.Interaction, name: str, bot_name: str, 
                 if resp.status == 200:
                     await interaction.followup.send(f"✅ Успешно! Группа Telegram (`{chat_id}`) связана с сетью `{name}`.")
                 else:
-                    await interaction.followup.send(f"⚠️ Связь сохранена, но бот не смог отправить приветственное сообщение в Telegram. Проверьте, добавлен ли бот в группу.")
+                    await interaction.followup.send(f"⚠️ Связь сохранена, но бот не смог отправить сообщение в Telegram.")
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка связывания моста Telegram: {e}")
 
 
 # ================= КОМАНДА: /brename =================
 @bot.tree.command(name="brename", description="Переименовать существующую кросс-сеть")
-@app_commands.describe(
-    old_name="Текущее уникальное имя вашей кросс-сети",
-    new_name="Новое имя для кросс-сети (только буквы, цифры и знаки дефиса)"
-)
 async def brename(interaction: discord.Interaction, old_name: str, new_name: str):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
@@ -648,7 +772,6 @@ async def brename(interaction: discord.Interaction, old_name: str, new_name: str
         old_meta_key = f"bridgemeta:{old_name}"
         old_cross_key = f"crossnet:{old_name}"
 
-        # 1. Проверяем существование сети и её тип
         mode_raw = await redis.get(old_meta_key)
         if not mode_raw:
             await interaction.followup.send(f"❌ Кросс-сеть `{old_name}` не найдена.")
@@ -659,42 +782,23 @@ async def brename(interaction: discord.Interaction, old_name: str, new_name: str
             await interaction.followup.send("❌ Переименовать можно только сети в режиме `cross`!")
             return
 
-        # 2. Проверяем владельца (первый подключенный канал в кросс-сети является создателем)
-        channels_raw = await redis.lrange(old_cross_key, 0, -1) or []
-        channels = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in channels_raw]
-
-        if not channels:
-            await interaction.followup.send("❌ Ошибка структуры сети: в ней отсутствуют каналы.")
-            return
-
-        creator_channel_id = int(channels[0])
-        creator_channel_exists = interaction.guild.get_channel(creator_channel_id)
-
-        if not creator_channel_exists:
-            await interaction.followup.send("❌ Переименовать сеть может только администратор сервера, который изначально её создал!")
-            return
-
-        # 3. Проверяем, не занато ли новое имя
         new_meta_key = f"bridgemeta:{new_name}"
         if await redis.exists(new_meta_key):
-            await interaction.followup.send(f"❌ Имя `{new_name}` уже занято другой сетью или мостом!")
+            await interaction.followup.send(f"❌ Имя `{new_name}` уже занято!")
             return
 
-        # 4. Выполняем атомарный перенос ключей в Redis
         new_cross_key = f"crossnet:{new_name}"
         
         await redis.rename(old_meta_key, new_meta_key)
         await redis.rename(old_cross_key, new_cross_key)
 
-        # Переносим связи Telegram
-        tg_links_exist = await redis.exists(f"tg_links:{old_name}")
-        if tg_links_exist:
+        if await redis.exists(f"tg_links:{old_name}"):
             await redis.rename(f"tg_links:{old_name}", f"tg_links:{new_name}")
 
-        await interaction.followup.send(f"🎉 Кросс-сеть успешно переименована из `{old_name}` в `{new_name}`! Все участники продолжают общение.")
+        await interaction.followup.send(f"🎉 Кросс-сеть переименована из `{old_name}` в `{new_name}`!")
 
     except Exception as e:
-        await interaction.followup.send(f"❌ Ошибка в процессе переименования: {e}")
+        await interaction.followup.send(f"❌ Ошибка переименования: {e}")
 
 
 # ================= КОМАНДА: /bdelete =================
@@ -721,11 +825,11 @@ async def bdelete(interaction: discord.Interaction, name: str):
             if name == channel_id_str:
                 await redis.delete(f"bridge:{name}")
                 await redis.delete(meta_key)
-                await interaction.followup.send(f"🗑️ Single-мост `{name}` полностью удален из базы данных.")
+                await interaction.followup.send(f"🗑️ Single-мост `{name}` удален.")
             else:
                 bridge_key = f"bridge:{name}"
                 await redis.lrem(bridge_key, 0, channel_id_str)
-                await interaction.followup.send(f"🔌 Канал успешно отвязан от моста `{name}`.")
+                await interaction.followup.send(f"🔌 Канал отвязан от моста `{name}`.")
 
         elif mode == "cross":
             cross_key = f"crossnet:{name}"
@@ -736,23 +840,23 @@ async def bdelete(interaction: discord.Interaction, name: str):
                 await redis.delete(cross_key)
                 await redis.delete(meta_key)
                 await redis.delete(f"tg_links:{name}")
-                await interaction.followup.send(f"🗑️ Кросс-сеть `{name}` опустела и была полностью удалена.")
+                await interaction.followup.send(f"🗑️ Кросс-сеть `{name}` полностью удалена.")
             else:
-                await interaction.followup.send(f"🔌 Этот канал успешно вышел из кросс-сети `{name}`.")
+                await interaction.followup.send(f"🔌 Канал вышел из кросс-сети `{name}`.")
 
     except Exception as e:
-        await interaction.followup.send(f"❌ Ошибка удаления/выхода: {e}")
+        await interaction.followup.send(f"❌ Ошибка удаления: {e}")
 
 
 # ================= КОМАНДА: /blist =================
-@bot.tree.command(name="blist", description="Показать список мостов, связанных с каналами этого сервера")
+@bot.tree.command(name="blist", description="Показать список мостов этого сервера")
 async def blist(interaction: discord.Interaction):
     if not interaction.guild:
-        await interaction.response.send_message("❌ Эту команду можно использовать только на сервере!", ephemeral=True)
+        await interaction.response.send_message("❌ Ток на сервере!", ephemeral=True)
         return
 
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ У вас должны быть права администратора!", ephemeral=True)
+        await interaction.response.send_message("❌ Нужны права администратора!", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -770,7 +874,7 @@ async def blist(interaction: discord.Interaction):
         cross_keys = {k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in cross_keys_raw}
 
         embed = discord.Embed(
-            title=f"🌐 Активные связи мостов для сервера {interaction.guild.name}", 
+            title=f"🌐 Активные мосты сервера {interaction.guild.name}", 
             color=0x2ecc71
         )
         
@@ -822,8 +926,8 @@ async def blist(interaction: discord.Interaction):
                     source_info = await resolve_channel_name(source_id)
                     targets_info = await format_channels(targets)
                     embed.add_field(
-                        name=f"📢 Single-Мост (Источник: {source_info})",
-                        value=f"➡️ ... транслируется в:\n{targets_info}",
+                        name=f"📢 Single-Мост ({source_info})",
+                        value=f"➡️ Транслируется в:\n{targets_info}",
                         inline=False
                     )
 
@@ -838,12 +942,11 @@ async def blist(interaction: discord.Interaction):
                 shown_count += 1
                 channels_info = await format_channels(channels)
                 
-                # Читаем связанные TG группы
                 tg_links_raw = await redis.smembers(f"tg_links:{cross_name}") or []
                 tg_links = [link.decode('utf-8') if isinstance(link, bytes) else str(link) for link in tg_links_raw]
                 tg_info = ""
                 if tg_links:
-                    tg_info = "\n📱 **Telegram мосты:**\n" + "\n".join([f"• Чат `{link.split(':')[0]}` (бот: `{link.split(':')[1]}`)" for link in tg_links])
+                    tg_info = "\n📱 **Telegram:**\n" + "\n".join([f"• Чат `{link.split(':')[0]}` (бот: `{link.split(':')[1]}`)" for link in tg_links])
 
                 embed.add_field(
                     name=f"👑 Cross-сеть: `{cross_name}`",
@@ -852,12 +955,12 @@ async def blist(interaction: discord.Interaction):
                 )
 
         if shown_count == 0:
-            await interaction.followup.send("📭 На этом сервере не найдено активных мостов.")
+            await interaction.followup.send("📭 Активных мостов не найдено.")
         else:
             await interaction.followup.send(embed=embed)
 
     except Exception as e:
-        await interaction.followup.send(f"❌ Ошибка при получении списка: {e}")
+        await interaction.followup.send(f"❌ Ошибка получения списка: {e}")
 
 
 # ================= АВТОЗАПУСК СЕРВЕРА С БОТОМ =================
